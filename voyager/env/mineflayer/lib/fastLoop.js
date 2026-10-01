@@ -26,7 +26,11 @@ const WALK_TIMEOUT_MS = 9000;
 const MINE_TIMEOUT_MS = 30000;
 const CRAFT_TIMEOUT_MS = 20000;
 const ATTACK_TIMEOUT_S = 20;
-const NO_PROGRESS_DEFAULT_S = 75;
+// No-progress fires on whichever comes first: wall clock or a run of
+// actions without a target gain (decisions are fast, so count them too).
+const NO_PROGRESS_DEFAULT_S = 30;
+const NO_PROGRESS_DEFAULT_ACTIONS = 5;
+const MAX_SUBGOAL_CANDIDATES = 8;
 const STUCK_WINDOW_ACTIONS = 4;
 const STUCK_DISTANCE = 1.5;
 const RECENT_ACTIONS = 5;
@@ -180,6 +184,18 @@ function countMatching(inventory, matches) {
     return total;
 }
 
+// Longest shared underscore-suffix: iron_ore + deepslate_iron_ore -> "iron_ore".
+function commonSuffix(names) {
+    const parts = names.map((n) => n.split("_"));
+    const out = [];
+    for (let i = 1; ; i++) {
+        const seg = parts[0][parts[0].length - i];
+        if (seg === undefined || !parts.every((p) => p[p.length - i] === seg)) break;
+        out.unshift(seg);
+    }
+    return out.join("_") || names[0];
+}
+
 function matcherFor(key) {
     if (key.startsWith("*_")) {
         const suffix = key.slice(2);
@@ -210,6 +226,114 @@ class FastLoop {
         this.lastProgressAt = Date.now();
         this.startedAt = Date.now();
         this.abortCurrent = null;
+        this.actionsSinceProgress = 0;
+        this.highGoal = null;
+        this.highTarget = null;
+        this.highGoalReached = false;
+        this._recipes = null;
+    }
+
+    // ---- subgoal derivation ---------------------------------------------
+    // Candidate subgoals for a high goal, derived from recipes and the world.
+    // Each carries an explicit target so the chosen text never needs to be
+    // re-parsed. One level per call: the brain re-derives after each subgoal.
+    async deriveSubgoals(text, override) {
+        const target = await this.parseTarget(text, override);
+        const inventory = this.inventoryCounts();
+        const out = [];
+        const seen = new Set();
+        const add = (c) => {
+            if (seen.has(c.text) || out.length >= MAX_SUBGOAL_CANDIDATES) return;
+            seen.add(c.text);
+            out.push(c);
+        };
+        if (target && target.kind !== "nearBlock") {
+            const summary = this.summarise(target);
+            const remaining = Math.max(1, summary.need - summary.gained);
+            const itemDef = target.key.startsWith("*_") ? null : this.mcData.itemsByName[target.key];
+            const blocks = Object.keys(this.mcData.blocksByName).filter(
+                (b) => target.matches(b) || target.matches(ORE_DROPS[b] || "")
+            );
+            // Items that drop from a block are mined, not crafted (raw_iron has a
+            // recipe from raw_iron_block, which is never the sensible route).
+            if (itemDef && !blocks.length) {
+                const plan = this.bestRecipe(itemDef.id, remaining, inventory);
+                if (plan) {
+                    const table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 32 });
+                    if (plan.requiresTable && !table) {
+                        if (inventory.crafting_table) {
+                            add({ text: "Place the crafting table", target: { nearBlock: "crafting_table" }, why: "the recipe needs a crafting table and one is in the inventory" });
+                        } else {
+                            add({ text: "Obtain 1 crafting_table", target: { item: "crafting_table", count: 1 }, why: "the recipe needs a crafting table" });
+                        }
+                    }
+                    for (const [name, missing] of Object.entries(plan.missing)) {
+                        add({ text: `Obtain ${missing} ${name}`, target: { item: name, count: missing }, why: `ingredient for ${target.key}` });
+                    }
+                    if (!Object.keys(plan.missing).length) {
+                        add({ text: `Craft ${remaining} ${target.key}`, target: { item: target.key, count: remaining }, why: "all ingredients are in the inventory" });
+                    }
+                }
+            }
+            if (blocks.length) {
+                const nearby = this.blockNearby((b) => blocks.includes(b));
+                const tier = this.requiredPickaxe(blocks);
+                if (tier && PICKAXE_TIER.indexOf(tier) > PICKAXE_TIER.indexOf(this.toolTier())) {
+                    add({ text: `Obtain 1 ${tier}_pickaxe`, target: { item: `${tier}_pickaxe`, count: 1 }, why: `${blocks[0]} needs at least a ${tier} pickaxe` });
+                }
+                const family = target.key.startsWith("*_") ? target.key : blocks.length === 1 ? blocks[0] : `*_${commonSuffix(blocks)}`;
+                if (nearby) {
+                    add({ text: `Mine ${remaining} ${target.key}`, target: { item: target.key, count: remaining }, why: "a matching block is within reach" });
+                } else {
+                    add({ text: `Explore to find ${family}`, target: { nearBlock: family }, why: "no matching block is within scan range" });
+                }
+            }
+        }
+        if (this.bot.food < 10 && !EDIBLE.some((f) => inventory[f])) {
+            add({ text: "Obtain 1 cooked_beef", target: { item: "*_beef", count: 1 }, why: "hunger is low and there is no food" });
+        }
+        add({ text, target: override || (target ? { item: target.key, count: target.need } : { none: true }), why: "work on the high goal directly" });
+        return { target: this.summarise(target), candidates: out };
+    }
+
+    // Recipe for `itemId` that leaves the fewest ingredients missing, scaled to `need`.
+    bestRecipe(itemId, need, inventory) {
+        if (!this._recipes) this._recipes = require("prismarine-recipe")(this.bot.version).Recipe;
+        let best = null;
+        for (const recipe of this._recipes.find(itemId, null)) {
+            const crafts = Math.ceil(need / Math.max(1, recipe.result.count));
+            const missing = {};
+            let total = 0;
+            for (const d of recipe.delta) {
+                if (d.count >= 0) continue;
+                const item = this.mcData.items[d.id];
+                if (!item) continue;
+                const short = -d.count * crafts - (inventory[item.name] || 0);
+                if (short > 0) {
+                    missing[item.name] = short;
+                    total += short;
+                }
+            }
+            if (!best || total < best.total) best = { total, missing, requiresTable: recipe.requiresTable };
+        }
+        return best;
+    }
+
+    // Lowest pickaxe tier that harvests any of `blocks`, or null when hands do.
+    requiredPickaxe(blocks) {
+        let tier = null;
+        for (const name of blocks) {
+            const tools = this.mcData.blocksByName[name] && this.mcData.blocksByName[name].harvestTools;
+            if (!tools) continue;
+            let lowest = null;
+            for (const id of Object.keys(tools)) {
+                const item = this.mcData.items[id];
+                const m = item && item.name.match(/^(\w+)_pickaxe$/);
+                if (m && (lowest === null || PICKAXE_TIER.indexOf(m[1]) < lowest)) lowest = PICKAXE_TIER.indexOf(m[1]);
+            }
+            if (lowest !== null && (tier === null || lowest < tier)) tier = lowest;
+        }
+        return tier === null ? null : PICKAXE_TIER[tier];
     }
 
     // ---- lifecycle -------------------------------------------------------
@@ -224,9 +348,26 @@ class FastLoop {
             context: goal.context || "",
             kind: goal.kind || "task", // "task" | "standing"
             noProgressSeconds: goal.noProgressSeconds || NO_PROGRESS_DEFAULT_S,
+            noProgressActions: goal.noProgressActions || NO_PROGRESS_DEFAULT_ACTIONS,
             hint: goal.hint || null,
+            highGoalId: goal.highGoal ? goal.highGoal.id || goal.highGoal.text : null,
         };
         this.target = await this.parseTarget(this.goal.text, goal.target);
+        // The high goal is parsed once per id so its baseline survives subgoal changes.
+        if (goal.highGoal && goal.highGoal.text) {
+            const hid = goal.highGoal.id || goal.highGoal.text;
+            if (!this.highGoal || this.highGoal.id !== hid) {
+                this.highGoal = { id: hid, text: goal.highGoal.text };
+                this.highTarget = await this.parseTarget(goal.highGoal.text, goal.highGoal.target);
+                this.highGoalReached = false;
+                console.log(`fastLoop: high goal "${this.highGoal.text}" target=${JSON.stringify(this.summarise(this.highTarget))}`);
+            }
+        } else if (this.goal.kind !== "standing") {
+            this.highGoal = null;
+            this.highTarget = null;
+            this.highGoalReached = false;
+        }
+        this.actionsSinceProgress = 0;
         // replay: an explicit list, or the entry for the parsed target in a
         // library of {targetKey: [actions]} the brain built for this situation
         this.replay = Array.isArray(goal.replay) ? [...goal.replay] : [];
@@ -293,6 +434,11 @@ class FastLoop {
     async parseTarget(text, override) {
         const inventory = this.inventoryCounts();
         if (override && override.none) return null; // e.g. a standing goal
+        if (override && override.nearBlock) {
+            // reached when a matching block is within scan range (exploration subgoals)
+            const key = String(override.nearBlock);
+            return { kind: "nearBlock", key: `near:${key}`, block: key, need: 1, matches: matcherFor(key), startHave: 0 };
+        }
         if (override && override.item) {
             const key = String(override.item);
             const matches = matcherFor(key);
@@ -367,14 +513,31 @@ class FastLoop {
     }
 
     targetSummary() {
-        if (!this.target) return null;
-        const have = countMatching(this.inventoryCounts(), this.target.matches);
+        return this.summarise(this.target);
+    }
+
+    summarise(target) {
+        if (!target) return null;
+        if (target.kind === "nearBlock") {
+            const have = this.blockNearby(target.matches) ? 1 : 0;
+            return { item: target.key, need: 1, have, gained: have };
+        }
+        const have = countMatching(this.inventoryCounts(), target.matches);
         return {
-            item: this.target.key,
-            need: this.target.need,
+            item: target.key,
+            need: target.need,
             have,
-            gained: have - this.target.startHave,
+            gained: have - target.startHave,
         };
+    }
+
+    blockNearby(matches) {
+        const ids = [];
+        for (const [name, block] of Object.entries(this.mcData.blocksByName)) {
+            if (matches(name)) ids.push(block.id);
+        }
+        if (!ids.length) return false;
+        return this.bot.findBlocks({ matching: ids, maxDistance: RESOURCE_SCAN_DISTANCE, count: 1 }).length > 0;
     }
 
     // ---- observation helpers --------------------------------------------
@@ -495,11 +658,27 @@ class FastLoop {
             if (sig !== this._lastInventorySig) this.lastProgressAt = now;
             this._lastInventorySig = sig;
         }
-        // 2. no progress for too long
+        // 1b. the high goal (parsed once; survives subgoal changes)
+        if (this.highTarget && !this.highGoalReached) {
+            const high = this.summarise(this.highTarget);
+            if (high.gained >= high.need) {
+                this.highGoalReached = true;
+                this.pushTrigger("high_goal_reached", { target: high, highGoalId: this.highGoal.id });
+            }
+        }
+        // 2. no progress for too long: by wall clock or by action count
         const idle = (now - this.lastProgressAt) / 1000;
-        if (!this.goalReached && idle > this.goal.noProgressSeconds) {
-            this.pushTrigger("no_progress", { seconds: Math.round(idle), target: snap.target });
+        if (
+            !this.goalReached &&
+            (idle > this.goal.noProgressSeconds || this.actionsSinceProgress >= this.goal.noProgressActions)
+        ) {
+            this.pushTrigger("no_progress", {
+                seconds: Math.round(idle),
+                actions: this.actionsSinceProgress,
+                target: snap.target,
+            });
             this.lastProgressAt = now; // re-arm
+            this.actionsSinceProgress = 0;
         }
         // 3. hazards
         const hostiles = snap.entities.filter((e) => HOSTILE.has(e.name) && e.distance <= 6);
@@ -912,12 +1091,14 @@ class FastLoop {
             const after = this.targetSummary();
             const gain = before && after ? after.gained - before.gained : 0;
             this.stats.actions++;
+            this.actionsSinceProgress = gain > 0 ? 0 : this.actionsSinceProgress + 1;
             this.recent.push({
                 action,
                 outcome: gain > 0 ? `${outcome}, +${gain} ${after.item}` : outcome,
             });
             if (this.recent.length > RECENT_ACTIONS) this.recent.shift();
-            this.trace.push({ action, outcome, gain, ms: Date.now() - t0 });
+            const held = this.bot.heldItem;
+            this.trace.push({ action, outcome, gain, ms: Date.now() - t0, tool: held ? held.name : null });
         }
     }
 
@@ -946,6 +1127,10 @@ class FastLoop {
             goal: this.goal,
             target: this.targetSummary(),
             goalReached: this.goalReached,
+            highGoal: this.highGoal || null,
+            highTarget: this.summarise(this.highTarget),
+            highGoalReached: Boolean(this.highGoalReached),
+            inventory: this.bot.entity ? this.inventoryCounts() : {},
             triggers,
             recentActions: this.recent,
             trace: this.trace,

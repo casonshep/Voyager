@@ -154,6 +154,56 @@ function check(label, ok, detail) {
     loop.goalReached = false;
     check("heuristic mines the target", loop.heuristic(snap, menu) === "mine:oak_log");
 
+    console.log("--- subgoal derivation ---");
+    const names = (r) => r.candidates.map((c) => c.text);
+    bot.inventory.items = () => [];
+    let derived = await loop.deriveSubgoals("Craft a wooden pickaxe");
+    console.log("  empty inventory:", names(derived).join(" | "));
+    check("empty inventory -> obtain planks and sticks", /Obtain 3 \w+_planks/.test(names(derived).join()) && names(derived).some((t) => /Obtain 2 stick/.test(t)));
+    check("high goal itself is offered", names(derived).includes("Craft a wooden pickaxe"));
+    bot.inventory.items = () => [{ name: "oak_planks", count: 3 }, { name: "stick", count: 2 }];
+    derived = await loop.deriveSubgoals("Craft a wooden pickaxe");
+    console.log("  planks+sticks:", names(derived).join(" | "));
+    check("ingredients present -> needs a crafting table first", names(derived)[0] === "Obtain 1 crafting_table");
+    bot.inventory.items = () => [{ name: "oak_planks", count: 3 }, { name: "stick", count: 2 }, { name: "crafting_table", count: 1 }];
+    derived = await loop.deriveSubgoals("Craft a wooden pickaxe");
+    check("table in inventory -> place it (nearBlock target)", derived.candidates[0].text === "Place the crafting table" && derived.candidates[0].target.nearBlock === "crafting_table");
+    check("...then craft", names(derived).includes("Craft 1 wooden_pickaxe"));
+    bot.inventory.items = () => [{ name: "wooden_pickaxe", count: 1 }];
+    derived = await loop.deriveSubgoals("Mine 3 iron ore");
+    console.log("  iron ore, wooden pickaxe:", names(derived).join(" | "));
+    check("iron ore needs a stone pickaxe", names(derived).includes("Obtain 1 stone_pickaxe"));
+    check("no iron nearby -> explore with nearBlock target", derived.candidates.some((c) => c.target && c.target.nearBlock === "*_iron_ore"));
+    check("raw_iron is mined, not crafted from raw_iron_block", !names(derived).some((t) => /raw_iron_block/.test(t)));
+    bot.inventory.items = () => [];
+    derived = await loop.deriveSubgoals("Mine 3 wood logs");
+    check("logs nearby -> mine them", names(derived).includes("Mine 3 *_log"));
+
+    console.log("--- nearBlock and high goal targets ---");
+    const near = await loop.parseTarget("Explore to find lava", { nearBlock: "lava" });
+    check("lava is within scan -> nearBlock reached", loop.summarise(near).gained === 1);
+    const far = await loop.parseTarget("Explore to find iron ore", { nearBlock: "iron_ore" });
+    check("iron ore is not -> nearBlock pending", loop.summarise(far).gained === 0);
+    loop.active = true; // setGoal must not start the run loop in this dry run
+    loop.run = async () => {};
+    await loop.setGoal({ id: "s1", text: "Obtain 2 oak_log", target: { item: "oak_log", count: 2 }, highGoal: { id: "h1", text: "Mine 3 wood logs" } });
+    check("high goal parsed once", loop.highGoal && loop.highGoal.id === "h1" && loop.highTarget.key === "*_log");
+    bot.inventory.items = () => [{ name: "oak_log", count: 2 }];
+    loop.pending = [];
+    loop.checkTriggers(loop.snapshot());
+    check("subgoal reached, high goal not yet", loop.pending.some((t) => t.type === "goal_reached") && !loop.pending.some((t) => t.type === "high_goal_reached"));
+    await loop.setGoal({ id: "s2", text: "Obtain 1 oak_log", target: { item: "oak_log", count: 1 }, highGoal: { id: "h1", text: "Mine 3 wood logs" } });
+    check("baseline kept across subgoals", loop.highTarget.startHave === 0);
+    bot.inventory.items = () => [{ name: "oak_log", count: 3 }];
+    loop.pending = [];
+    loop.checkTriggers(loop.snapshot());
+    check("high_goal_reached fires at 3 logs", loop.pending.some((t) => t.type === "high_goal_reached"));
+    loop.active = false;
+    bot.inventory.items = () => [{ name: "oak_log", count: 2 }, { name: "oak_planks", count: 4 }, { name: "apple", count: 1 }];
+    loop.goal = { id: "g1", text: "Mine 3 wood logs", context: "", kind: "task", noProgressSeconds: 75, noProgressActions: 5, hint: null };
+    loop.target = await loop.parseTarget(loop.goal.text);
+    loop.goalReached = false;
+
     console.log("--- one Jev decision ---");
     if (!process.env.TYPESAFE_API_KEY) {
         console.log("TYPESAFE_API_KEY not set; skipping the live decision (heuristic fallback is used in that case)");

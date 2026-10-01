@@ -477,6 +477,20 @@ app.post("/fast/goal", async (req, res) => {
     }
 });
 
+app.post("/fast/subgoals", async (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const body = req.body || {};
+        res.json(await bot.fastLoop.deriveSubgoals(String(body.text || ""), body.target));
+    } catch (err) {
+        console.log("fast/subgoals failed:", err);
+        res.status(400).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
 app.get("/fast/status", (req, res) => {
     if (!bot || !bot.entity || !bot.fastLoop) {
         res.status(400).json({ error: "Bot not spawned" });

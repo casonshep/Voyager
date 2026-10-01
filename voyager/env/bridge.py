@@ -146,6 +146,16 @@ class VoyagerEnv(gym.Env):
             raise RuntimeError(f"fast/goal failed: {res.status_code} {res.text[:200]}")
         return res.json()
 
+    def fast_subgoals(self, text: str, target: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Candidate subgoals for a high goal, derived in Node from recipes and the world."""
+        payload: Dict[str, Any] = {"text": text}
+        if target:
+            payload["target"] = target
+        res = requests.post(f"{self.server}/fast/subgoals", json=payload, timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/subgoals failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
     def fast_status(self) -> Dict[str, Any]:
         """Drain the fast loop's triggers and observations since the last poll."""
         res = requests.get(f"{self.server}/fast/status", timeout=60)

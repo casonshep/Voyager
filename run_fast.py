@@ -34,7 +34,6 @@ brain = FastBrain(
     voyager,
     poll_seconds=1.0,
     goal_timeout_seconds=300,
-    stalls_before_gpt=2,
-    stalls_before_fail=4,
+    subgoal_failures_before_fail=3,
 )
 brain.learn()
