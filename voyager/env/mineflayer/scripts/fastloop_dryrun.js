@@ -97,6 +97,12 @@ function check(label, ok, detail) {
         ["Mine 5 cobblestone", "cobblestone", 5],
         ["Mine 3 iron ore", "raw_iron", 3],
         ["Kill 1 cow", null, 1],
+        ["Smelt 1 raw iron", "iron_ingot", 1],
+        ["Cook 2 beef", "cooked_beef", 2],
+        ["Place a crafting table", null, 1],
+        ["Equip the stone sword", null, 1],
+        ["Deposit useless items into the chest at x=1, y=2, z=3", null, 1],
+        ["Mine 1 stone", "cobblestone", 1],
     ];
     const loop = new FastLoop(bot);
     for (const [text, expectKey, expectNeed] of cases) {

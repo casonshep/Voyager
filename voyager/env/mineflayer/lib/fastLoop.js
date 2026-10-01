@@ -75,6 +75,8 @@ const FUELS = ["coal", "charcoal", "oak_planks", "spruce_planks", "birch_planks"
 const SMELTABLE = { raw_iron: "iron_ingot", raw_copper: "copper_ingot", raw_gold: "gold_ingot",
     beef: "cooked_beef", porkchop: "cooked_porkchop", mutton: "cooked_mutton",
     chicken: "cooked_chicken", cobblestone: "stone", sand: "glass" };
+const NO_TARGET_VERB_RE =
+    /^\s*(place|put|equip|wear|deposit|store|eat|consume|kill|hunt|explore|find|build|use|sleep|plant|drink)\b/i;
 const RESOURCE_BLOCK_RE =
     /_log$|_ore$|^stone$|^cobblestone$|^dirt$|^sand$|^gravel$|^deepslate$|^grass_block$|_leaves$|^crafting_table$|^furnace$|^chest$|^obsidian$|^clay$|^sugar_cane$|^bamboo$|^cactus$|_wool$|^pumpkin$|^melon$|^sweet_berry_bush$|^wheat$/;
 
@@ -301,6 +303,10 @@ class FastLoop {
                 startHave: countMatching(inventory, matches),
             };
         }
+        // Tasks whose item leaves the inventory (place, equip, deposit, eat)
+        // or that have no item at all (kill, explore) have no countable
+        // target: the Jev goalReached Noul decides completion instead.
+        if (NO_TARGET_VERB_RE.test(text)) return null;
         const candidates = findTargetCandidates(text, this.mcData);
         const numbers = text.match(/\b(\d+)\b/);
         const need = numbers ? parseInt(numbers[1], 10) : 1;
@@ -312,8 +318,14 @@ class FastLoop {
         }
         if (!chosen) return null;
         const resolved = { key: chosen.key, need, matches: chosen.matches };
+        // Smelting or cooking counts by the output item, not the consumed input.
+        if (chosen.kind === "exact" && SMELTABLE[chosen.key] && /\b(smelt|cook|bake)\b/i.test(text)) {
+            const out = SMELTABLE[chosen.key];
+            resolved.key = out;
+            resolved.matches = (x) => x === out;
+        }
         // Mining an ore counts by its drop; mining stone counts by cobblestone.
-        if (
+        else if (
             chosen.kind === "exact" &&
             ORE_DROPS[chosen.key] &&
             /\b(mine|collect|gather|get|obtain|dig)\b/i.test(text)
@@ -665,8 +677,9 @@ class FastLoop {
                 };
                 if (!snap.target) {
                     questions.goalReached = traversal.noulFn(
-                        "Looking at `inventory`, `nearbyEntities` and `bot`, has `goal.text` " +
-                            "already been accomplished so no further action is needed?"
+                        "Looking at `inventory`, `nearbyResources` (placed blocks such as a " +
+                            "crafting table or chest appear here), `nearbyEntities` and `bot`, " +
+                            "has `goal.text` already been accomplished so no further action is needed?"
                     );
                 }
                 const { answers } = await client.systemOne(
@@ -883,11 +896,19 @@ class FastLoop {
                 this.positions = [];
             }
             const menu = this.buildMenu(snap);
-            const action = this.nextReplay(menu) || (await this.decide(snap, menu));
+            const replayed = this.nextReplay(menu);
+            const action = replayed || (await this.decide(snap, menu));
             if (!this.active || !this.goal || this.goal.id !== goalId) continue;
             const before = this.targetSummary();
             const t0 = Date.now();
             const outcome = await this.execute(action);
+            // a new goal may have landed mid-action: its trace must not inherit this outcome
+            if (!this.goal || this.goal.id !== goalId) continue;
+            if (replayed && !/^ok/.test(outcome)) {
+                console.log(`fastLoop: replay step "${action}" ${outcome}, handing control to Jev`);
+                this.replay = [];
+            }
+            if (!/^ok/.test(outcome)) await sleep(400); // no hot loop on instant failures
             const after = this.targetSummary();
             const gain = before && after ? after.gained - before.gained : 0;
             this.stats.actions++;

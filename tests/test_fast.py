@@ -54,3 +54,73 @@ def test_merge_events_keeps_trailing_observe():
     merged2 = FastBrain._merge_events(merged, [["onChat", {}], ["observe", {"inventory": {}}]])
     assert merged2[-1][1] == {"inventory": {}}
     assert FastBrain._inventory(merged) == {"oak_log": 1}
+
+
+class _StubEnv:
+    """Minimal stand-in for VoyagerEnv in fast mode."""
+
+    def __init__(self):
+        self.goals = []
+        self.polls = 0
+        self.pause_server = True
+
+    def fast_goal(self, goal):
+        self.goals.append(goal)
+        return {"replayRemaining": len(goal.get("sequenceLibrary", {}).get("*_log", [])), "replaySource": "*_log"}
+
+    def fast_status(self):
+        self.polls += 1
+        observe = ["observe", {"inventory": {"oak_log": 3}, "status": {"position": {"x": 0, "z": 0}}}]
+        if self.polls == 1:
+            return {"triggers": [], "events": [observe], "target": {"item": "*_log", "need": 3, "have": 1, "gained": 1}}
+        return {
+            "triggers": [{"type": "goal_reached", "goalId": self.goals[-1]["id"], "detail": {"target": {"item": "*_log"}}}],
+            "events": [["onSave", {"onSave": "oak_log_mined"}], observe],
+            "target": {"item": "*_log", "need": 3, "have": 3, "gained": 3},
+            "collapsedTrace": [{"action": "mine:oak_log", "times": 3}],
+            "fingerprint": {"biome": "plains", "toolTier": "none", "daylight": "day"},
+            "stats": {"actions": 3, "decisions": 3},
+            "trace": [],
+            "replayRemaining": 0,
+            "replaySource": None,
+        }
+
+    def fast_stop(self):
+        return {}
+
+
+class _Stub:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_run_task_success_stores_sequence():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        env = _StubEnv()
+        recorded = []
+        logged = []
+        voyager = _Stub(
+            env=env,
+            ckpt_dir=d,
+            resume=True,
+            recorder=_Stub(iteration=0, record=lambda events, task: recorded.append((task, events))),
+            jev=_Stub(enabled=False, iteration=0, log_only=lambda gate, rec: logged.append((gate, rec))),
+            typesafe_critic_threshold=0.8,
+            action_agent=_Stub(chest_memory={}),
+            curriculum_agent=_Stub(completed_tasks=[], failed_tasks=[]),
+        )
+        brain = FastBrain(voyager, poll_seconds=0.0)
+        assert env.pause_server is False
+        brain.last_status = {"fingerprint": {"biome": "plains", "toolTier": "none", "daylight": "day"}}
+        info = brain.run_task("Mine 3 wood logs", "any log counts")
+        assert info == {"task": "Mine 3 wood logs", "success": True}
+        assert env.goals[0]["text"] == "Mine 3 wood logs" and env.goals[0]["kind"] == "task"
+        assert recorded and recorded[0][1][-1][0] == "observe"
+        assert logged and logged[0][0] == "fast_goals" and logged[0][1]["success"] is True
+        assert brain.sequences.lookup("*_log", {"biome": "plains", "toolTier": "none", "daylight": "day"}) == ["mine:oak_log"] * 3
+        assert os.path.exists(os.path.join(d, "fast", "sequences.json"))
+        # second run in the same situation hands the remembered sequence to the loop
+        brain.run_task("Mine 3 wood logs", "any log counts")
+        assert env.goals[-1]["sequenceLibrary"] == {"*_log": ["mine:oak_log"] * 3}
