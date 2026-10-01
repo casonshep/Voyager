@@ -547,7 +547,7 @@ def load_text_lines(*fpaths):
 
 
 def dump_text(s, *fpaths):
-    with open(f_join(*fpaths), "w") as fp:
+    with open(f_join(*fpaths), "w", encoding="utf-8") as fp:
         fp.write(s)
 
 
