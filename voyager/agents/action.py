@@ -3,7 +3,7 @@ import time
 
 import voyager.utils as U
 from javascript import require
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.prompts import SystemMessagePromptTemplate
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 
@@ -82,6 +82,7 @@ class ActionAgent:
             "placeItem",
             "smeltItem",
             "killMob",
+            "askJev",
         ]
         if not self.llm.model_name == "gpt-3.5-turbo":
             base_skills += [

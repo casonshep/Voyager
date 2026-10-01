@@ -145,6 +145,37 @@ voyager.inference(sub_goals=sub_goals)
 
 For all valid skill libraries, see [Learned Skill Libraries](skill_library/README.md).
 
+# TypeSafe (Jev) Gates
+
+Voyager can consult [TypeSafe](https://docs.typesafe.ai)'s Jev model for typed judgments next to the GPT agents. Set `TYPESAFE_API_KEY` in your environment (or `.env`); without it every gate is a silent no-op and Voyager behaves exactly as before.
+
+| Gate | Mode | What it does |
+| --- | --- | --- |
+| Critic shadow | log only | After each GPT critic verdict, Jev judges success from the same final state (plus the inventory delta since the task started). Both verdicts are logged for agreement analysis; GPT keeps control. |
+| QA gating | active | Jev scores the curriculum's generated questions for usefulness; only the top `typesafe_qa_keep` are answered by GPT. Near-duplicate cached questions are reused when Jev agrees they ask the same thing. |
+| Task fan-out | veto active, score logged | Each GPT-proposed task is checked for rule violations (placing/building/planting/trading, pointless repeats, unchanged failed tasks). A veto re-asks GPT with the reason, at most twice. A feasibility score and verb class are logged for later use. |
+
+Records go to `<ckpt_dir>/typesafe/*.jsonl`. Tunables on `Voyager(...)`: `typesafe_enabled`, `typesafe_model`, `typesafe_critic_threshold`, `typesafe_veto_threshold`, `typesafe_qa_keep`.
+
+```bash
+python scripts/check_typesafe_state.py      # offline sanity check of the state builder
+python scripts/typesafe_agreement.py ckpt   # Jev vs GPT critic agreement after a run
+```
+
+Beyond the gates, Jev also steers exploration and is available to generated skills:
+
+| Where | What it does |
+| --- | --- |
+| `exploreUntil` traversal | Every ~10 s of exploration, Jev picks the next compass direction (or up/down/stay) from a terrain survey; pathfinder walks there. Falls back to the original random walk when Jev is unavailable or unsure. |
+| `askJev(bot, question, options, context)` primitive | Generated skills can ask one Choice question about the live game state for judgment calls (which target, whether to retreat, where to place). Returns `{choice, confidence, probabilities}` or `null`; at most 20 calls per program. Exact facts such as inventory checks stay in code. |
+
+Between tasks the bot is reset in place (`POST /reset` on the mineflayer server: stop pathing, clear controls, cancel pvp/collect tasks, reset per-task counters and timers) instead of restarting the Node process. Hard resets and error recovery still restart the process.
+
+```bash
+# Node does not read .env; export the key first (Voyager itself inherits it via load_dotenv).
+cd voyager/env/mineflayer && TYPESAFE_API_KEY=... node scripts/jev_dryrun.js   # traversal + askJev against a canned world, no Minecraft
+```
+
 # FAQ
 If you have any questions, please check our [FAQ](FAQ.md) first before opening an issue.
 

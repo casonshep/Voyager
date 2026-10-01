@@ -1,11 +1,14 @@
 // Explore downward for 60 seconds: exploreUntil(bot, new Vec3(0, -1, 0), 60);
+// Waypoints are chosen by Jev (TypeSafe) from the game state when available;
+// `direction` is used as a hint for Jev and as the random-walk fallback.
 async function exploreUntil(
     bot,
     direction,
     maxTime = 60,
     callback = () => {
         return false;
-    }
+    },
+    objective = ""
 ) {
     if (typeof maxTime !== "number") {
         throw new Error("maxTime must be a number");
@@ -40,14 +43,19 @@ async function exploreUntil(
 
         let explorationInterval;
         let maxTimeTimeout;
+        let deciding = false;
+        let finished = false;
+        let lastDecisionTime = 0;
+        const DECISION_INTERVAL_MS = 10000;
 
         const cleanUp = () => {
+            finished = true;
             clearInterval(explorationInterval);
             clearTimeout(maxTimeTimeout);
             bot.pathfinder.setGoal(null);
         };
 
-        const explore = () => {
+        const randomGoal = () => {
             const x =
                 bot.entity.position.x +
                 Math.floor(Math.random() * 20 + 10) * dx;
@@ -57,25 +65,71 @@ async function exploreUntil(
             const z =
                 bot.entity.position.z +
                 Math.floor(Math.random() * 20 + 10) * dz;
-            let goal = new GoalNear(x, y, z);
             if (dy === 0) {
-                goal = new GoalNearXZ(x, z);
+                return new GoalNearXZ(x, z);
             }
-            bot.pathfinder.setGoal(goal);
+            return new GoalNear(x, y, z);
+        };
 
+        const decide = () => {
+            // Each decision is a billed API call: only re-decide when the
+            // bot has stopped moving or the current leg has run a while.
+            const now = Date.now();
+            if (
+                deciding ||
+                (bot.pathfinder.isMoving() &&
+                    now - lastDecisionTime < DECISION_INTERVAL_MS)
+            ) {
+                return;
+            }
+            deciding = true;
+            lastDecisionTime = now;
+            if (typeof bot.jevNextGoal !== "function") {
+                bot.pathfinder.setGoal(randomGoal());
+                deciding = false;
+                return;
+            }
+            bot.jevNextGoal({
+                objective,
+                direction: { x: dx, y: dy, z: dz },
+            })
+                .then((decision) => {
+                    // The decision may resolve after exploration ended; a
+                    // late setGoal would steer the bot during later code.
+                    if (finished) return;
+                    if (decision && decision.goal) {
+                        bot.pathfinder.setGoal(decision.goal);
+                    } else if (!decision || decision.choice !== "stay") {
+                        bot.pathfinder.setGoal(randomGoal());
+                    }
+                })
+                .catch(() => {
+                    if (finished) return;
+                    bot.pathfinder.setGoal(randomGoal());
+                })
+                .finally(() => {
+                    deciding = false;
+                });
+        };
+
+        const explore = () => {
             try {
                 const result = callback();
                 if (result) {
                     cleanUp();
                     bot.chat("Explore success.");
                     resolve(result);
+                    return;
                 }
             } catch (err) {
                 cleanUp();
                 reject(err);
+                return;
             }
+            decide();
         };
 
+        explore();
         explorationInterval = setInterval(explore, 2000);
 
         maxTimeTimeout = setTimeout(() => {

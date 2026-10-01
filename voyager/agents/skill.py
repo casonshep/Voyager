@@ -1,10 +1,10 @@
 import os
 
 import voyager.utils as U
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain.schema import HumanMessage, SystemMessage
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 from voyager.prompts import load_prompt
 from voyager.control_primitives import load_control_primitives
@@ -97,7 +97,8 @@ class SkillManager:
             f"{self.ckpt_dir}/skill/description/{dumped_program_name}.txt",
         )
         U.dump_json(self.skills, f"{self.ckpt_dir}/skill/skills.json")
-        self.vectordb.persist()
+        # self.vectordb.save_local(self.ckpt_dir + "/skill/vectordb")
+
 
     def generate_skill_description(self, program_name, program_code):
         messages = [
