@@ -136,6 +136,7 @@ class VoyagerEnv(gym.Env):
         if options is None:
             options = {}
 
+
         if options.get("inventory", {}) and options.get("mode", "hard") != "hard":
             raise RuntimeError("inventory can only be set when options is hard")
 
@@ -159,6 +160,7 @@ class VoyagerEnv(gym.Env):
         # All the reset in step will be soft
         self.reset_options["reset"] = "soft"
         self.pause()
+
         return json.loads(returned_data)
 
     def close(self):
