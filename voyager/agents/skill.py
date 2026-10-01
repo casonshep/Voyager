@@ -7,6 +7,7 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain_chroma import Chroma
 
 from voyager.prompts import load_prompt
+from voyager.utils import timing
 from voyager.control_primitives import load_control_primitives
 
 
@@ -24,6 +25,7 @@ class SkillManager:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("skill")],
         )
         U.f_mkdir(f"{ckpt_dir}/skill/code")
         U.f_mkdir(f"{ckpt_dir}/skill/description")

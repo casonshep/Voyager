@@ -113,6 +113,7 @@ app.post("/start", (req, res) => {
         // bot.collectBlock.movements.placeCost = 0;
 
         require("./lib/jevTraversal").inject(bot);
+        require("./lib/fastLoop").inject(bot);
 
         obs.inject(bot, [
             OnChat,
@@ -272,6 +273,8 @@ app.post("/step", async (req, res) => {
     const programs = req.body.programs;
     bot.cumulativeObs = [];
     bot.jevAskCalls = 0;
+    // generated code and the fast loop must never drive the bot at once
+    if (bot.fastLoop) await bot.fastLoop.stop();
     await bot.waitForTicks(bot.waitTicks);
     const r = await evaluateCode(code, programs);
     process.off("uncaughtException", otherError);
@@ -453,6 +456,53 @@ app.post("/step", async (req, res) => {
             return source + err.message + "\n" + code_source;
         }
         return err.message;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Fast loop endpoints (see lib/fastLoop.js). Python posts a goal and polls
+// status; the bot keeps acting between polls and the server is never paused.
+// ---------------------------------------------------------------------------
+app.post("/fast/goal", async (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const status = await bot.fastLoop.setGoal(req.body || {});
+        res.json(status);
+    } catch (err) {
+        console.log("fast/goal failed:", err);
+        res.status(400).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.get("/fast/status", (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const status = bot.fastLoop.status();
+        // bot.observe() drains cumulativeObs; this is its only caller in fast mode
+        status.events = bot.observe();
+        res.json(status);
+    } catch (err) {
+        console.log("fast/status failed:", err);
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.post("/fast/stop", async (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.json({ running: false });
+        return;
+    }
+    try {
+        await bot.fastLoop.stop();
+        res.json({ running: false });
+    } catch (err) {
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
     }
 });
 

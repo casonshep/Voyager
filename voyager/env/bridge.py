@@ -10,6 +10,7 @@ import gymnasium as gym
 from gymnasium.core import ObsType
 
 import voyager.utils as U
+from voyager.utils import timing
 
 from .minecraft_launcher import MinecraftInstance
 from .process_monitor import SubprocessMonitor
@@ -24,6 +25,7 @@ class VoyagerEnv(gym.Env):
         server_port=3000,
         request_timeout=600,
         log_path="./logs",
+        pause_server=True,
     ):
         if not mc_port and not azure_login:
             raise ValueError("Either mc_port or azure_login must be specified")
@@ -37,6 +39,9 @@ class VoyagerEnv(gym.Env):
         self.server_port = server_port
         self.request_timeout = request_timeout
         self.log_path = log_path
+        # When False the Minecraft server is never paused between steps, so the
+        # bot keeps acting while Python thinks (used by the fast loop).
+        self.pause_server = pause_server
         self.mineflayer = self.get_mineflayer_process(server_port)
         if azure_login:
             self.mc_instance = self.get_mc_instance()
@@ -115,14 +120,50 @@ class VoyagerEnv(gym.Env):
             "code": code,
             "programs": programs,
         }
-        res = requests.post(
-            f"{self.server}/step", json=data, timeout=self.request_timeout
-        )
+        with timing.timed("env.step"):
+            res = requests.post(
+                f"{self.server}/step", json=data, timeout=self.request_timeout
+            )
         if res.status_code != 200:
             raise RuntimeError("Failed to step Minecraft server")
         returned_data = res.json()
         self.pause()
         return json.loads(returned_data)
+
+    # ------------------------------------------------------------------ #
+    # Fast loop: a goal-driven controller that runs inside the mineflayer
+    # process. Python posts goals and polls status; the bot never waits
+    # for Python between actions.
+    # ------------------------------------------------------------------ #
+
+    def fast_goal(self, goal: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace the fast loop's current goal and (re)start it."""
+        self.check_process()
+        self.unpause()
+        with timing.timed("env.fast_goal"):
+            res = requests.post(f"{self.server}/fast/goal", json=goal, timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/goal failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_status(self) -> Dict[str, Any]:
+        """Drain the fast loop's triggers and observations since the last poll."""
+        res = requests.get(f"{self.server}/fast/status", timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/status failed: {res.status_code} {res.text[:200]}")
+        data = res.json()
+        if isinstance(data.get("events"), str):
+            data["events"] = json.loads(data["events"])
+        return data
+
+    def fast_stop(self) -> Dict[str, Any]:
+        """Stop the fast loop; the bot idles until the next goal."""
+        if not self.mineflayer.is_running:
+            return {}
+        res = requests.post(f"{self.server}/fast/stop", timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/stop failed: {res.status_code} {res.text[:200]}")
+        return res.json()
 
     def render(self):
         raise NotImplementedError("render is not implemented")
@@ -152,12 +193,13 @@ class VoyagerEnv(gym.Env):
 
         self.unpause()
         returned_data = None
-        if self.reset_options["reset"] == "soft":
-            returned_data = self.soft_reset()
-        if returned_data is None:
-            self.mineflayer.stop()
-            time.sleep(1)  # wait for mineflayer to exit
-            returned_data = self.check_process()
+        with timing.timed("env.reset", mode=self.reset_options["reset"]):
+            if self.reset_options["reset"] == "soft":
+                returned_data = self.soft_reset()
+            if returned_data is None:
+                self.mineflayer.stop()
+                time.sleep(1)  # wait for mineflayer to exit
+                returned_data = self.check_process()
         self.has_reset = True
         self.connected = True
         # All the reset in step will be soft
@@ -203,6 +245,8 @@ class VoyagerEnv(gym.Env):
         return not self.connected
 
     def pause(self):
+        if not self.pause_server:
+            return False
         if self.mineflayer.is_running and not self.server_paused:
             res = requests.post(f"{self.server}/pause")
             if res.status_code == 200:

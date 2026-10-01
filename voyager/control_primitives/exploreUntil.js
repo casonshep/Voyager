@@ -46,12 +46,16 @@ async function exploreUntil(
         let deciding = false;
         let finished = false;
         let lastDecisionTime = 0;
+        let prefetched = null; // next Jev decision, requested before the leg ends
         const DECISION_INTERVAL_MS = 10000;
+        const PREFETCH_DISTANCE = 5;
 
         const cleanUp = () => {
             finished = true;
             clearInterval(explorationInterval);
             clearTimeout(maxTimeTimeout);
+            bot.removeListener("goal_reached", onLegDone);
+            bot.removeListener("path_update", onPathUpdate);
             bot.pathfinder.setGoal(null);
         };
 
@@ -71,13 +75,34 @@ async function exploreUntil(
             return new GoalNear(x, y, z);
         };
 
-        const decide = () => {
-            // Each decision is a billed API call: only re-decide when the
-            // bot has stopped moving or the current leg has run a while.
+        const applyDecision = (decision) => {
+            // The decision may resolve after exploration ended; a
+            // late setGoal would steer the bot during later code.
+            if (finished) return;
+            if (decision && decision.goal) {
+                bot.pathfinder.setGoal(decision.goal);
+            } else if (!decision || decision.choice !== "stay") {
+                bot.pathfinder.setGoal(randomGoal());
+            }
+        };
+
+        const requestDecision = () =>
+            bot
+                .jevNextGoal({
+                    objective,
+                    direction: { x: dx, y: dy, z: dz },
+                })
+                .catch(() => null);
+
+        const decide = (force = false) => {
+            // Each decision is a billed API call: re-decide when a leg ends
+            // (goal_reached / no path), when a prefetched answer is ready, or
+            // when the current leg has run a while.
             const now = Date.now();
             if (
                 deciding ||
-                (bot.pathfinder.isMoving() &&
+                (!force &&
+                    bot.pathfinder.isMoving() &&
                     now - lastDecisionTime < DECISION_INTERVAL_MS)
             ) {
                 return;
@@ -89,28 +114,37 @@ async function exploreUntil(
                 deciding = false;
                 return;
             }
-            bot.jevNextGoal({
-                objective,
-                direction: { x: dx, y: dy, z: dz },
-            })
-                .then((decision) => {
-                    // The decision may resolve after exploration ended; a
-                    // late setGoal would steer the bot during later code.
-                    if (finished) return;
-                    if (decision && decision.goal) {
-                        bot.pathfinder.setGoal(decision.goal);
-                    } else if (!decision || decision.choice !== "stay") {
-                        bot.pathfinder.setGoal(randomGoal());
-                    }
-                })
-                .catch(() => {
-                    if (finished) return;
-                    bot.pathfinder.setGoal(randomGoal());
-                })
-                .finally(() => {
-                    deciding = false;
-                });
+            const pending = prefetched || requestDecision();
+            prefetched = null;
+            pending.then(applyDecision).finally(() => {
+                deciding = false;
+            });
         };
+
+        // Event-driven re-decide: no idle gap between legs.
+        const onLegDone = () => {
+            if (finished) return;
+            decide(true);
+        };
+        const onPathUpdate = (results) => {
+            if (finished || deciding) return;
+            if (results.status === "noPath" || results.status === "timeout") {
+                decide(true);
+                return;
+            }
+            // Start the next decision while the last few blocks are walked.
+            if (
+                !prefetched &&
+                typeof bot.jevNextGoal === "function" &&
+                results.path &&
+                results.path.length > 0 &&
+                results.path.length <= PREFETCH_DISTANCE
+            ) {
+                prefetched = requestDecision();
+            }
+        };
+        bot.on("goal_reached", onLegDone);
+        bot.on("path_update", onPathUpdate);
 
         const explore = () => {
             try {

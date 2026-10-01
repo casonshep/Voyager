@@ -23,6 +23,14 @@ function withTimeout(promise, ms, label) {
 }
 
 async function cleanupBot(bot) {
+    // 0. the fast loop is the only other controller of the bot
+    if (bot.fastLoop) {
+        try {
+            await withTimeout(bot.fastLoop.stop(), PLUGIN_STOP_TIMEOUT_MS * 3, "fastLoop.stop");
+        } catch (err) {
+            console.log("cleanup: fastLoop", err.message);
+        }
+    }
     // 1. plugins that drive the pathfinder: ask them to stop first
     let pvpStop = null;
     try {

@@ -5,6 +5,7 @@ import re
 
 import voyager.utils as U
 from voyager.prompts import load_prompt
+from voyager.utils import timing
 from voyager.utils.json_utils import fix_and_parse_json
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
@@ -40,11 +41,13 @@ class CurriculumAgent:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("curriculum")],
         )
         self.qa_llm = ChatOpenAI(
             model_name=qa_model_name,
             temperature=qa_temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("curriculum_qa")],
         )
         assert mode in [
             "auto",

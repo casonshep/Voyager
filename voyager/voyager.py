@@ -12,6 +12,7 @@ from .agents import CriticAgent
 from .agents import CurriculumAgent
 from .agents import SkillManager
 from .typesafe import JevClient, build_state, critic_shadow
+from .utils import timing
 
 
 # TODO: remove event memory
@@ -22,7 +23,7 @@ class Voyager:
         azure_login: Dict[str, str] = None,
         server_port: int = 3000,
         openai_api_key: str = None,
-        env_wait_ticks: int = 20,
+        env_wait_ticks: int = 10,
         env_request_timeout: int = 600,
         max_iterations: int = 160,
         reset_placed_if_failed: bool = False,
@@ -39,8 +40,8 @@ class Voyager:
         curriculum_agent_core_inventory_items: str = r".*_log|.*_planks|stick|crafting_table|furnace"
         r"|cobblestone|dirt|coal|.*_pickaxe|.*_sword|.*_axe",
         curriculum_agent_mode: str = "auto",
-        critic_agent_model_name: str = "o4-mini",
-        critic_agent_temperature: float = 1,
+        critic_agent_model_name: str = "gpt-4o-mini",
+        critic_agent_temperature: float = 0,
         critic_agent_mode: str = "auto",
         skill_manager_model_name: str = "gpt-3.5-turbo",
         skill_manager_temperature: float = 0,
@@ -111,6 +112,8 @@ class Voyager:
         :param typesafe_veto_threshold: Noul threshold above which a curriculum proposal is sent back to GPT
         :param typesafe_qa_keep: how many GPT-generated curriculum QA questions to answer per step
         """
+        self.ckpt_dir = ckpt_dir
+        timing.configure(ckpt_dir)
         # init env
         self.env = VoyagerEnv(
             mc_port=mc_port,

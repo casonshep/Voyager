@@ -176,6 +176,25 @@ Between tasks the bot is reset in place (`POST /reset` on the mineflayer server:
 cd voyager/env/mineflayer && TYPESAFE_API_KEY=... node scripts/jev_dryrun.js   # traversal + askJev against a canned world, no Minecraft
 ```
 
+# Fast Mode (Jev action loop + goal brain)
+
+`run_fast.py` runs Voyager with two timescales instead of the step/pause cycle:
+
+| Layer | Where | Cadence | What it does |
+| --- | --- | --- | --- |
+| Fast loop | `voyager/env/mineflayer/lib/fastLoop.js` | every action (~0.2 s Jev call + the primitive itself) | Snapshots the world, builds a menu of bounded primitives (`walk:<dir>`, `climb:up`, `dig:down`, `mine:<block>`, `craft:<item>`, `smelt:<item>`, `place:<block>`, `attack:<mob>`, `flee`, `eat`, `wait`) with live facts in each description, asks Jev one Choice plus a danger Noul, executes the pick, and repeats. Code owns the exact checks. |
+| Goal brain | `voyager/fast/brain.py` | per goal | Asks the curriculum for the next task, posts it as a goal, polls `/fast/status` about once a second and drains triggers. While GPT proposes the next task the bot works on a standing "gather resources, stay safe" goal. |
+| Sequence memory | `voyager/fast/sequences.py` | on success | Stores the collapsed primitive sequence under target item + coarse fingerprint (biome class, pickaxe tier, day/night) in `ckpt/fast/sequences.json`; an exact fingerprint match replays it, falling back to Jev on the first unavailable or failed step. |
+
+Goal recalculation is triggered by code, not by raw inventory changes: **goal reached** (exact count on the parsed target, or a Jev Noul for goals without one), **no progress** (target count unchanged for 75 s; after two of these the GPT action agent writes one program through `/step`, after four the goal fails), **hazard** (health drop, lava, drowning, hostile within 6 blocks), and **stuck** (no movement over four move actions). The Minecraft server is never paused in fast mode (`VoyagerEnv(pause_server=False)`), and the GPT critic is not called.
+
+```bash
+venv/Scripts/python run_fast.py                              # MC_PORT env var overrides the port
+cd voyager/env/mineflayer && TYPESAFE_API_KEY=... node scripts/fastloop_dryrun.js   # target parsing, menu, one real Jev decision; no Minecraft
+```
+
+Every LLM call and environment round trip is timed to `ckpt/timing.jsonl` (`voyager/utils/timing.py`) in both modes, so the GPT / Jev / Minecraft split of a run can be read off the log.
+
 # FAQ
 If you have any questions, please check our [FAQ](FAQ.md) first before opening an issue.
 

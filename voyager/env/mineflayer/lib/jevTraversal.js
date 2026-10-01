@@ -30,6 +30,7 @@ const COMPASS = {
 
 let client; // undefined = not initialized, null = unavailable
 let choiceFn;
+let noulFn;
 
 function getClient() {
     if (client !== undefined) return client;
@@ -44,6 +45,7 @@ function getClient() {
         const sdk = require("@typesafe-ai/sdk");
         client = new sdk.TypeSafeClient();
         choiceFn = sdk.choice;
+        noulFn = sdk.noul;
     } catch (err) {
         console.log("jevTraversal: TypeSafe SDK unavailable:", err.message);
         client = null;
@@ -419,4 +421,17 @@ module.exports = {
     gatherState,
     askJevChoice,
     MAX_ASK_CALLS_PER_STEP,
+    // shared with the fast loop (lib/fastLoop.js)
+    getClient,
+    COMPASS,
+    surveyCandidate,
+    nearbyEntitiesOf,
+    get choiceFn() {
+        getClient();
+        return choiceFn;
+    },
+    get noulFn() {
+        getClient();
+        return noulFn;
+    },
 };
