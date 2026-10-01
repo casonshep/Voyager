@@ -127,3 +127,10 @@ debug_*
 logs/
 plot_iter.py
 *.svg
+
+# claude
+.claude/*
+
+node_modules/*
+# git worktree checkouts kept inside the repo
+upgrade-movement/

@@ -145,6 +145,25 @@ voyager.inference(sub_goals=sub_goals)
 
 For all valid skill libraries, see [Learned Skill Libraries](skill_library/README.md).
 
+# TypeSafe (Jev) Gates
+
+Voyager can consult [TypeSafe](https://docs.typesafe.ai)'s Jev model for typed judgments next to the GPT agents. Set `TYPESAFE_API_KEY` in your environment (or `.env`); without it every gate is a silent no-op and Voyager behaves exactly as before.
+
+| Gate | Mode | What it does |
+| --- | --- | --- |
+| Critic shadow | log only | After each GPT critic verdict, Jev judges success from the same final state (plus the inventory delta since the task started). Both verdicts are logged for agreement analysis; GPT keeps control. |
+| QA gating | active | Jev scores the curriculum's generated questions for usefulness; only the top `typesafe_qa_keep` are answered by GPT. Near-duplicate cached questions are reused when Jev agrees they ask the same thing. |
+| Task fan-out | veto active, score logged | Each GPT-proposed task is checked for rule violations (placing/building/planting/trading, pointless repeats, unchanged failed tasks). A veto re-asks GPT with the reason, at most twice. A feasibility score and verb class are logged for later use. |
+
+Records go to `<ckpt_dir>/typesafe/*.jsonl`. Tunables on `Voyager(...)`: `typesafe_enabled`, `typesafe_model`, `typesafe_critic_threshold`, `typesafe_veto_threshold`, `typesafe_qa_keep`.
+
+```bash
+python scripts/check_typesafe_state.py      # offline sanity check of the state builder
+python scripts/typesafe_agreement.py ckpt   # Jev vs GPT critic agreement after a run
+```
+
+No movement or pathfinding behaviour is touched by these gates.
+
 # FAQ
 If you have any questions, please check our [FAQ](FAQ.md) first before opening an issue.
 

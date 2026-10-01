@@ -11,6 +11,7 @@ from .agents import ActionAgent
 from .agents import CriticAgent
 from .agents import CurriculumAgent
 from .agents import SkillManager
+from .typesafe import JevClient, build_state, critic_shadow
 
 
 # TODO: remove event memory
@@ -48,6 +49,11 @@ class Voyager:
         ckpt_dir: str = "ckpt",
         skill_library_dir: str = None,
         resume: bool = False,
+        typesafe_enabled: bool = True,
+        typesafe_model: str = "jev-latest",
+        typesafe_critic_threshold: float = 0.8,
+        typesafe_veto_threshold: float = 0.7,
+        typesafe_qa_keep: int = 5,
     ):
         """
         The main class for Voyager.
@@ -99,6 +105,11 @@ class Voyager:
         :param ckpt_dir: checkpoint dir
         :param skill_library_dir: skill library dir
         :param resume: whether to resume from checkpoint
+        :param typesafe_enabled: run TypeSafe (Jev) gates; silently disabled when TYPESAFE_API_KEY is unset
+        :param typesafe_model: TypeSafe model alias
+        :param typesafe_critic_threshold: Noul threshold used only to log what Jev's critic verdict would be
+        :param typesafe_veto_threshold: Noul threshold above which a curriculum proposal is sent back to GPT
+        :param typesafe_qa_keep: how many GPT-generated curriculum QA questions to answer per step
         """
         # init env
         self.env = VoyagerEnv(
@@ -113,6 +124,14 @@ class Voyager:
 
         # set openai api key
         os.environ["OPENAI_API_KEY"] = openai_api_key
+
+        # init TypeSafe (Jev) client; a disabled client turns every gate into a no-op
+        self.jev = JevClient(
+            enabled=typesafe_enabled,
+            model=typesafe_model,
+            ckpt_dir=ckpt_dir,
+        )
+        self.typesafe_critic_threshold = typesafe_critic_threshold
 
         # init agents
         self.action_agent = ActionAgent(
@@ -136,6 +155,9 @@ class Voyager:
             mode=curriculum_agent_mode,
             warm_up=curriculum_agent_warm_up,
             core_inventory_items=curriculum_agent_core_inventory_items,
+            jev=self.jev,
+            veto_threshold=typesafe_veto_threshold,
+            qa_keep=typesafe_qa_keep,
         )
         self.critic_agent = CriticAgent(
             model_name=critic_agent_model_name,
@@ -161,6 +183,7 @@ class Voyager:
         self.messages = None
         self.conversations = []
         self.last_events = None
+        self.inventory_before = None
 
     def reset(self, task, context="", reset_env=True):
         self.action_agent_rollout_num_iter = 0
@@ -181,6 +204,9 @@ class Voyager:
             "bot.chat(`/time set ${getNextTime()}`);\n"
             + f"bot.chat('/difficulty {difficulty}');"
         )
+        # snapshot once per task so Jev can judge what was gained across all retries
+        self.inventory_before = copy.deepcopy(events[-1][1]["inventory"])
+        self.jev.iteration = self.recorder.iteration
         skills = self.skill_manager.retrieve_skills(query=self.context)
         print(
             f"\033[33mRender Action Agent system message with {len(skills)} skills\033[0m"
@@ -225,6 +251,8 @@ class Voyager:
                 chest_observation=self.action_agent.render_chest_observation(),
                 max_retries=5,
             )
+            # Shadow judgment: must run before reset_placed_if_failed mutates events
+            self._critic_shadow(events, gpt_success=success, gpt_critique=critique)
 
             if self.reset_placed_if_failed and not success:
                 # revert all the placing event in the last step
@@ -284,6 +312,44 @@ class Voyager:
             )
         return self.messages, 0, done, info
 
+    def _critic_shadow(self, events, *, gpt_success, gpt_critique):
+        """Log Jev's view of task success next to GPT's verdict. Never changes control flow."""
+        if not self.jev.enabled:
+            return
+        if any(event_type == "onError" for event_type, _ in events):
+            return  # the GPT critic skips these too; nothing to compare
+        try:
+            state = build_state(
+                events,
+                task=self.task,
+                context=self.context,
+                chest_memory=self.action_agent.chest_memory,
+                completed_tasks=self.curriculum_agent.completed_tasks,
+                failed_tasks=self.curriculum_agent.failed_tasks,
+                inventory_before=self.inventory_before,
+            )
+            result = critic_shadow(
+                self.jev,
+                state,
+                gpt_success=gpt_success,
+                gpt_critique=gpt_critique,
+                threshold=self.typesafe_critic_threshold,
+            )
+        except Exception as e:  # shadow mode must never break a rollout
+            print(f"\033[31mJev critic shadow failed: {e}\033[0m")
+            return
+        if result is None:
+            return
+        jev_would_say = result.success >= self.typesafe_critic_threshold
+        delta = (
+            f"{result.success_by_delta:.2f}" if result.success_by_delta is not None else "n/a"
+        )
+        print(
+            f"\033[35mJev critic shadow: success={result.success:.2f} delta={delta} "
+            f"gpt={gpt_success} agree={jev_would_say == gpt_success} "
+            f"channel={result.verification_channel}\033[0m"
+        )
+
     def rollout(self, *, task, context, reset_env=True):
         self.reset(task=task, context=context, reset_env=reset_env)
         while True:
@@ -317,9 +383,11 @@ class Voyager:
             if self.recorder.iteration > self.max_iterations:
                 print("Iteration limit reached")
                 break
+            self.jev.iteration = self.recorder.iteration
             task, context = self.curriculum_agent.propose_next_task(
                 events=self.last_events,
                 chest_observation=self.action_agent.render_chest_observation(),
+                chest_memory=self.action_agent.chest_memory,
                 max_retries=5,
             )
             print(
