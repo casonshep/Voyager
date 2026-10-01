@@ -79,6 +79,18 @@ const FUELS = ["coal", "charcoal", "oak_planks", "spruce_planks", "birch_planks"
 const SMELTABLE = { raw_iron: "iron_ingot", raw_copper: "copper_ingot", raw_gold: "gold_ingot",
     beef: "cooked_beef", porkchop: "cooked_porkchop", mutton: "cooked_mutton",
     chicken: "cooked_chicken", cobblestone: "stone", sand: "glass" };
+// Blocks worth pillaring with, cheapest first.
+const PILLAR_BLOCKS = ["dirt", "cobblestone", "netherrack", "cobbled_deepslate", "andesite", "diorite",
+    "granite", "oak_planks", "spruce_planks", "birch_planks", "stone", "sand", "gravel"];
+const PILLAR_HEIGHT = 6;
+// Things nobody needs more than a stack of; deposited when the bag is nearly full.
+const JUNK = ["dirt", "cobblestone", "gravel", "sand", "andesite", "diorite", "granite", "cobbled_deepslate",
+    "wheat_seeds", "rotten_flesh", "flint", "string", "bone", "spider_eye", "gunpowder", "oak_sapling",
+    "birch_sapling", "spruce_sapling", "stick", "tuff", "netherrack", "clay_ball", "kelp", "seagrass"];
+const JUNK_KEEP = 16; // how many of a junk item to keep when depositing
+const INVENTORY_FULL = 30; // used slots (of 36) that make chest:deposit worth offering
+const LANDMARK_BLOCKS = ["crafting_table", "furnace", "chest"];
+const COLLECT_DISTANCE = 12;
 const NO_TARGET_VERB_RE =
     /^\s*(place|put|equip|wear|deposit|store|eat|consume|kill|hunt|explore|find|build|use|sleep|plant|drink)\b/i;
 const RESOURCE_BLOCK_RE =
@@ -231,6 +243,145 @@ class FastLoop {
         this.highTarget = null;
         this.highGoalReached = false;
         this._recipes = null;
+        this.landmarks = {}; // block name -> {x, y, z} of the last one seen; kept across goals
+    }
+
+    // Remember where useful blocks were last seen so the bot can walk back.
+    updateLandmarks() {
+        const bot = this.bot;
+        const here = bot.entity.position;
+        for (const name of LANDMARK_BLOCKS) {
+            const def = this.mcData.blocksByName[name];
+            if (!def) continue;
+            const block = bot.findBlock({ matching: def.id, maxDistance: 32 });
+            if (block) {
+                this.landmarks[name] = { x: block.position.x, y: block.position.y, z: block.position.z };
+            } else if (this.landmarks[name]) {
+                const l = this.landmarks[name];
+                // forget a landmark the bot is standing next to but can no longer see: it is gone
+                if (Math.hypot(l.x - here.x, l.y - here.y, l.z - here.z) < 24) delete this.landmarks[name];
+            }
+        }
+    }
+
+    droppedItems() {
+        const here = this.bot.entity.position;
+        return Object.values(this.bot.entities)
+            .filter((e) => e.name === "item" && e.position && e.position.distanceTo(here) <= COLLECT_DISTANCE)
+            .sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here));
+    }
+
+    // Poll a condition on each physics tick; resolves true when met, false on timeout.
+    waitFor(condition, ms) {
+        const bot = this.bot;
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                bot.removeListener("physicsTick", tick);
+                resolve(false);
+            }, ms);
+            const tick = () => {
+                let ok = false;
+                try {
+                    ok = condition();
+                } catch (err) {
+                    ok = false;
+                }
+                if (ok) {
+                    clearTimeout(timer);
+                    bot.removeListener("physicsTick", tick);
+                    resolve(true);
+                }
+            };
+            bot.on("physicsTick", tick);
+        });
+    }
+
+    // Jump-and-place tower: look down, jump, place the block under the feet
+    // once the bot has risen clear of its old position, land, repeat.
+    async pillarUp(height, isAborted) {
+        const bot = this.bot;
+        const blockName = PILLAR_BLOCKS.find((n) => this.inventoryCounts()[n]);
+        if (!blockName) return "failed: no blocks to pillar with";
+        const item = bot.inventory.items().find((i) => i.name === blockName);
+        await bot.equip(item, "hand");
+        let placed = 0;
+        for (let i = 0; i < height; i++) {
+            if (!this.active || isAborted()) break;
+            if (!this.inventoryCounts()[blockName]) break;
+            const feet = bot.entity.position.floored();
+            const ref = bot.blockAt(feet.offset(0, -1, 0));
+            if (!ref || ref.boundingBox !== "block") {
+                return placed ? `ok, pillared ${placed} (nothing solid below)` : "failed: nothing solid below";
+            }
+            const headroom = bot.blockAt(feet.offset(0, 2, 0));
+            if (headroom && headroom.boundingBox === "block") {
+                return placed ? `ok, pillared ${placed} (ceiling)` : "failed: ceiling overhead";
+            }
+            await bot.lookAt(feet.offset(0.5, -0.5, 0.5), true); // straight down, instantly
+            bot.setControlState("jump", true);
+            // the block goes where the feet were, so wait until the bot is well above that
+            const rose = await this.waitFor(() => bot.entity.position.y > feet.y + 0.8, 800);
+            if (!rose) {
+                bot.setControlState("jump", false);
+                return placed ? `ok, pillared ${placed} (could not jump)` : "failed: could not jump";
+            }
+            try {
+                await withTimeout(
+                    bot._placeBlockWithOptions(ref, new Vec3(0, 1, 0), { forceLook: "ignore", swingArm: "right" }),
+                    1500,
+                    "pillar place"
+                );
+                placed++;
+            } catch (err) {
+                bot.setControlState("jump", false);
+                return placed ? `ok, pillared ${placed} (${err.message.slice(0, 40)})` : `failed: ${err.message.slice(0, 60)}`;
+            } finally {
+                bot.setControlState("jump", false);
+            }
+            await this.waitFor(() => bot.entity.onGround, 1500);
+        }
+        return placed ? `ok, pillared ${placed}` : "failed: could not place";
+    }
+
+    // Items to put away: junk above a small keep count, never tools or the goal target.
+    junkToDeposit(inventory) {
+        const out = {};
+        for (const name of JUNK) {
+            const count = inventory[name] || 0;
+            if (count <= JUNK_KEEP) continue;
+            if (this.target && this.target.matches(name)) continue;
+            if (this.highTarget && this.highTarget.matches(name)) continue;
+            out[name] = count - JUNK_KEEP;
+        }
+        return out;
+    }
+
+    // Tools worth switching to right now: a sword when hostiles are near, the
+    // right pickaxe or axe for the blocks the goal is about.
+    equipOptions(snap) {
+        const held = this.bot.heldItem ? this.bot.heldItem.name : null;
+        const options = {};
+        const best = (kind) => {
+            let pick = null;
+            for (const name of Object.keys(snap.inventory)) {
+                const m = name.match(/^(\w+)_(sword|pickaxe|axe)$/);
+                if (!m || m[2] !== kind) continue;
+                if (!pick || PICKAXE_TIER.indexOf(m[1]) > PICKAXE_TIER.indexOf(pick.split("_")[0])) pick = name;
+            }
+            return pick;
+        };
+        const hostileNear = snap.entities.some((e) => HOSTILE.has(e.name) && e.distance <= 12);
+        const sword = best("sword");
+        if (hostileNear && sword && held !== sword) options[sword] = `Equip the ${sword} (a hostile mob is within 12 blocks)`;
+        const wantsLogs = this.target && Object.keys(snap.resources).some((b) => /_log$/.test(b) && this.target.matches(b));
+        const axe = best("axe");
+        if (wantsLogs && axe && held !== axe) options[axe] = `Equip the ${axe} for chopping logs`;
+        const wantsStone = this.target && Object.keys(snap.resources).some(
+            (b) => (/_ore$|^stone$|^deepslate$|^cobblestone$/.test(b)) && (this.target.matches(b) || this.target.matches(ORE_DROPS[b] || ""))
+        );
+        const pickaxe = best("pickaxe");
+        if (wantsStone && pickaxe && held !== pickaxe) options[pickaxe] = `Equip the ${pickaxe} for mining stone and ore`;
+        return options;
     }
 
     // ---- subgoal derivation ---------------------------------------------
@@ -614,6 +765,12 @@ class FastLoop {
     snapshot() {
         const bot = this.bot;
         const pos = bot.entity.position;
+        this.updateLandmarks();
+        const dropped = this.droppedItems();
+        const landmarks = {};
+        for (const [name, l] of Object.entries(this.landmarks)) {
+            landmarks[name] = { ...l, distance: Math.round(Math.hypot(l.x - pos.x, l.y - pos.y, l.z - pos.z)) };
+        }
         return {
             position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
             health: bot.health,
@@ -623,8 +780,15 @@ class FastLoop {
             inWater: bot.entity.isInWater,
             timeOfDay: bot.time ? bot.time.timeOfDay : 0,
             inventory: this.inventoryCounts(),
+            inventoryUsed: typeof bot.inventoryUsed === "function" ? bot.inventoryUsed() : null,
+            heldItem: bot.heldItem ? bot.heldItem.name : null,
             resources: this.nearbyResources(),
             entities: this.nearbyEntities(),
+            droppedItems: {
+                count: dropped.length,
+                nearest: dropped.length ? Math.round(dropped[0].position.distanceTo(pos)) : null,
+            },
+            landmarks,
             target: this.targetSummary(),
         };
     }
@@ -800,6 +964,38 @@ class FastLoop {
         }
         const food = EDIBLE.find((f) => snap.inventory[f]);
         if (food && snap.food < 16) menu["eat"] = `Eat ${food} (hunger is ${snap.food}/20)`;
+
+        // dropped items, pillaring, tools, storage, landmarks
+        if (snap.droppedItems.count) {
+            menu["collect:items"] =
+                `Walk over and pick up ${snap.droppedItems.count} dropped item stack(s), ` +
+                `nearest ${snap.droppedItems.nearest} blocks away`;
+        }
+        const pillarBlock = PILLAR_BLOCKS.find((n) => snap.inventory[n]);
+        if (pillarBlock && (!above || above.name === "air" || above.name === "cave_air")) {
+            menu["pillar:up"] =
+                `Jump-and-place a ${PILLAR_HEIGHT}-block tower of ${pillarBlock} straight up ` +
+                `(${snap.inventory[pillarBlock]} available; escapes pits and water, reaches the surface)`;
+        }
+        for (const [tool, description] of Object.entries(this.equipOptions(snap))) {
+            menu[`equip:${tool}`] = description;
+        }
+        if (snap.inventoryUsed !== null && snap.inventoryUsed >= INVENTORY_FULL) {
+            const junk = this.junkToDeposit(snap.inventory);
+            const chestNear = bot.findBlock({ matching: this.mcData.blocksByName.chest.id, maxDistance: 32 });
+            if (Object.keys(junk).length && chestNear) {
+                menu["chest:deposit"] =
+                    `Put ${Object.entries(junk).map(([n, c]) => `${c} ${n}`).join(", ")} into the chest ` +
+                    `${Math.round(chestNear.position.distanceTo(pos))} blocks away (inventory ${snap.inventoryUsed}/36 slots used)`;
+            } else if (Object.keys(junk).length && snap.inventory.chest) {
+                menu["place:chest"] = `Place the chest from inventory (inventory ${snap.inventoryUsed}/36 slots used, nothing to store in nearby)`;
+            }
+        }
+        for (const [name, l] of Object.entries(snap.landmarks)) {
+            if (l.distance > WALK_DISTANCE) {
+                menu[`return:${name}`] = `Walk back to the last ${name} seen, ${l.distance} blocks away at x=${l.x} y=${l.y} z=${l.z}`;
+            }
+        }
         menu["wait"] = "Do nothing for two seconds (only if nothing above is useful)";
         return menu;
     }
@@ -828,10 +1024,15 @@ class FastLoop {
                         bestPickaxe: this.toolTier(),
                     },
                     inventory: snap.inventory,
+                    inventoryUsedSlots: snap.inventoryUsed,
+                    heldItem: snap.heldItem,
                     nearbyResources: snap.resources,
                     nearbyEntities: snap.entities,
+                    droppedItems: snap.droppedItems,
+                    landmarks: snap.landmarks,
                     recentActions: this.recent,
                     secondsSinceProgress: Math.round((Date.now() - this.lastProgressAt) / 1000),
+                    actionsSinceProgress: this.actionsSinceProgress,
                 };
                 const questions = {
                     action: traversal.choiceFn(
@@ -839,9 +1040,12 @@ class FastLoop {
                             "`goal.target` is the exact item count still needed, when known). " +
                             "`inventory` maps item names to counts, `nearbyResources` lists " +
                             "block types with counts and nearest distance, `nearbyEntities` lists " +
-                            "mobs nearest first, and `recentActions` shows the last few actions " +
-                            "with their outcomes (avoid repeating ones that failed or made no " +
-                            "progress). `bot.timeOfDay` is 0-24000 and night starts near 13000. " +
+                            "mobs nearest first, `droppedItems` are item stacks lying on the ground, " +
+                            "`landmarks` are the last seen crafting table, furnace and chest with " +
+                            "distances, `heldItem` is what is in the hand, and `recentActions` shows " +
+                            "the last few actions with their outcomes (avoid repeating ones that " +
+                            "failed or made no progress). `bot.timeOfDay` is 0-24000 and night " +
+                            "starts near 13000. " +
                             "Each option is one bounded primitive the code will execute next. " +
                             "Which option makes the most progress toward the goal right now " +
                             "while keeping the bot safe (eat when hungry, deal with hostiles, " +
@@ -852,6 +1056,18 @@ class FastLoop {
                         "Is the bot in immediate physical danger that must be handled before " +
                             "working on the goal (hostile mob within a few blocks, health at or " +
                             "below 6, standing in or beside lava, drowning)?"
+                    ),
+                    stuck: traversal.noulFn(
+                        "Judging from `recentActions`, `actionsSinceProgress` and " +
+                            "`secondsSinceProgress`, is the bot stuck: repeating actions that time " +
+                            "out, fail, or change nothing, so that continuing the same way will " +
+                            "not reach the goal?"
+                    ),
+                    subgoalValid: traversal.noulFn(
+                        "Given `inventory`, `nearbyResources` and `landmarks` as they are now, does " +
+                            "`goal.text` still need doing? Answer no if it is already satisfied or " +
+                            "has become pointless (for example the item it asks for is already in " +
+                            "hand, or the block it asks to place is already placed nearby)."
                     ),
                 };
                 if (!snap.target) {
@@ -874,11 +1090,22 @@ class FastLoop {
                     confidence: a.confidence,
                     probabilities: a.probabilities,
                     danger: answers.danger.noul,
+                    stuck: answers.stuck.noul,
+                    subgoalValid: answers.subgoalValid.noul,
                     goalReached: answers.goalReached ? answers.goalReached.noul : null,
                     ms,
                 };
                 if (answers.danger.noul >= 0.7) {
                     this.pushTrigger("hazard", { jevDanger: answers.danger.noul });
+                }
+                if (answers.stuck.noul >= 0.7 && this.recent.length >= 3) {
+                    this.pushTrigger("stuck", { jevStuck: answers.stuck.noul, recent: this.recent.map((r) => r.action) });
+                    this.recent.push({ action: "nudge", outcome: "Jev judged the bot stuck; jumped in place" });
+                    nudge(this.bot);
+                }
+                if (answers.subgoalValid.noul <= 0.2 && this.goal.kind === "task" && !this.goalReached) {
+                    // not a failure: the brain re-selects without recording a skill
+                    this.pushTrigger("subgoal_obsolete", { subgoalValid: answers.subgoalValid.noul, target: snap.target });
                 }
                 if (answers.goalReached && answers.goalReached.noul >= 0.8 && !this.goalReached) {
                     this.goalReached = true;
@@ -1028,6 +1255,45 @@ class FastLoop {
                     await bot.equip(item, "hand");
                     await withTimeout(bot.consume(), 8000, action);
                     return "ok";
+                }
+                case "collect": {
+                    const drops = this.droppedItems();
+                    if (!drops.length) return "failed: nothing to pick up";
+                    const slots = typeof bot.inventoryUsed === "function" ? bot.inventoryUsed() : 0;
+                    const p = drops[0].position;
+                    const r = await gotoBounded(new goals.GoalNear(p.x, p.y, p.z, 0.5), WALK_TIMEOUT_MS);
+                    if (r !== "ok") return r;
+                    await sleep(300); // pickup happens on contact a tick or two later
+                    const after = typeof bot.inventoryUsed === "function" ? bot.inventoryUsed() : 0;
+                    return after > slots || this.droppedItems().length < drops.length ? "ok" : "ok, nothing picked up";
+                }
+                case "pillar": {
+                    let aborted = false;
+                    this.abortCurrent = () => {
+                        aborted = true;
+                        bot.setControlState("jump", false);
+                    };
+                    return await withTimeout(this.pillarUp(PILLAR_HEIGHT, () => aborted), 25000, action);
+                }
+                case "equip": {
+                    const item = bot.inventory.items().find((i) => i.name === arg);
+                    if (!item) return `failed: no ${arg} in inventory`;
+                    await withTimeout(bot.equip(item, "hand"), 5000, action);
+                    return "ok";
+                }
+                case "chest": {
+                    const chest = bot.findBlock({ matching: this.mcData.blocksByName.chest.id, maxDistance: 32 });
+                    if (!chest) return "failed: no chest nearby";
+                    const junk = this.junkToDeposit(this.inventoryCounts());
+                    if (!Object.keys(junk).length) return "ok, nothing to deposit";
+                    const slots = bot.inventoryUsed();
+                    await withTimeout(this.prims.depositItemIntoChest(bot, chest.position, junk), CRAFT_TIMEOUT_MS * 2, action);
+                    return bot.inventoryUsed() < slots ? "ok" : "deposited nothing";
+                }
+                case "return": {
+                    const l = this.landmarks[arg];
+                    if (!l) return `failed: no ${arg} remembered`;
+                    return await gotoBounded(new goals.GoalNear(l.x, l.y, l.z, 2), WALK_TIMEOUT_MS * 3);
                 }
                 case "wait":
                 default:

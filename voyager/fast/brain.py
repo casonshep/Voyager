@@ -183,6 +183,13 @@ class FastBrain:
                         break
                     subgoal = self._select_subgoal(high, context, status, failed_subgoals)
                     run = self._start_subgoal(high, context, subgoal, status)
+                elif kind == "subgoal_obsolete":
+                    # Jev judged the subgoal no longer needed: pick another, no skill, no failure
+                    print(f"\033[33mFast brain: subgoal '{subgoal['text']}' judged obsolete, re-selecting\033[0m")
+                    subgoal_log.append({"subgoal": subgoal["text"], "ok": None, "obsolete": True})
+                    failed_subgoals.add(subgoal["text"])  # do not offer the same text again this high goal
+                    subgoal = self._select_subgoal(high, context, status, failed_subgoals)
+                    run = self._start_subgoal(high, context, subgoal, status)
                 elif kind in ("hazard", "stuck"):
                     print(f"\033[33mFast brain: {kind} {detail}\033[0m")
             if success or subgoal_failures >= self.subgoal_failures_before_fail:
