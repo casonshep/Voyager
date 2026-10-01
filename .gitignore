@@ -132,3 +132,5 @@ plot_iter.py
 .claude/*
 
 node_modules/*
+# git worktree checkouts kept inside the repo
+upgrade-movement/
