@@ -211,6 +211,16 @@ async function decideNextMove(bot, { objective, direction } = {}) {
         return null;
     }
     if (!answer) return null;
+    if (
+        typeof answer.confidence !== "number" ||
+        typeof answer.choice !== "string"
+    ) {
+        console.log(
+            "jevTraversal: unexpected answer shape:",
+            JSON.stringify(answer)
+        );
+        return null;
+    }
     if (answer.confidence < MIN_CONFIDENCE) {
         console.log(
             `jevTraversal: low confidence ${answer.confidence.toFixed(2)} ` +

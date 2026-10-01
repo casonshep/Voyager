@@ -44,10 +44,12 @@ async function exploreUntil(
         let explorationInterval;
         let maxTimeTimeout;
         let deciding = false;
+        let finished = false;
         let lastDecisionTime = 0;
         const DECISION_INTERVAL_MS = 10000;
 
         const cleanUp = () => {
+            finished = true;
             clearInterval(explorationInterval);
             clearTimeout(maxTimeTimeout);
             bot.pathfinder.setGoal(null);
@@ -92,6 +94,9 @@ async function exploreUntil(
                 direction: { x: dx, y: dy, z: dz },
             })
                 .then((decision) => {
+                    // The decision may resolve after exploration ended; a
+                    // late setGoal would steer the bot during later code.
+                    if (finished) return;
                     if (decision && decision.goal) {
                         bot.pathfinder.setGoal(decision.goal);
                     } else if (!decision || decision.choice !== "stay") {
@@ -99,6 +104,7 @@ async function exploreUntil(
                     }
                 })
                 .catch(() => {
+                    if (finished) return;
                     bot.pathfinder.setGoal(randomGoal());
                 })
                 .finally(() => {
