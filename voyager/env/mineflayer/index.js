@@ -111,6 +111,8 @@ app.post("/start", (req, res) => {
         // bot.collectBlock.movements.digCost = 0;
         // bot.collectBlock.movements.placeCost = 0;
 
+        require("./lib/jevTraversal").inject(bot);
+
         obs.inject(bot, [
             OnChat,
             OnError,
