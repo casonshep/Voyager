@@ -5,6 +5,7 @@ const mineflayer = require("mineflayer");
 
 const skills = require("./lib/skillLoader");
 const { initCounter, getNextTime } = require("./lib/utils");
+const { cleanupBot } = require("./lib/botCleanup");
 const obs = require("./lib/observation/base");
 const OnChat = require("./lib/observation/onChat");
 const OnError = require("./lib/observation/onError");
@@ -153,6 +154,37 @@ app.post("/start", (req, res) => {
     }
 });
 
+// In-process reset between tasks: clear everything generated code may have
+// left on the long-lived bot without tearing down the Node process. Returns
+// an observation like /start so the Python bridge can treat both the same.
+app.post("/reset", async (req, res) => {
+    if (!bot || !bot.entity) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        bot.waitTicks = req.body.waitTicks || bot.waitTicks;
+        await cleanupBot(bot);
+        if (req.body.position) {
+            bot.chat(
+                `/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`
+            );
+        }
+        if (req.body.spread) {
+            bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
+            await bot.waitForTicks(bot.waitTicks);
+        }
+        bot.iron_pickaxe = Boolean(
+            bot.inventory.items().find((item) => item.name === "iron_pickaxe")
+        );
+        await bot.waitForTicks(bot.waitTicks);
+        res.json(bot.observe());
+    } catch (err) {
+        console.log("reset failed:", err);
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
 app.post("/step", async (req, res) => {
     // import useful package
     let response_sent = false;
@@ -239,6 +271,7 @@ app.post("/step", async (req, res) => {
     const code = req.body.code;
     const programs = req.body.programs;
     bot.cumulativeObs = [];
+    bot.jevAskCalls = 0;
     await bot.waitForTicks(bot.waitTicks);
     const r = await evaluateCode(code, programs);
     process.off("uncaughtException", otherError);
@@ -255,12 +288,33 @@ app.post("/step", async (req, res) => {
     bot.removeListener("physicTick", onTick);
 
     async function evaluateCode(code, programs) {
-        // Echo the code produced for players to see it. Don't echo when the bot code is already producing dialog or it will double echo
+        // Timers started by the program (or by primitives it calls) are tracked
+        // so nothing keeps ticking after the program finishes. The shim must stay
+        // on the first line: handleError maps stack line numbers relative to
+        // `programs`, so adding lines here would shift every reported line.
+        const timers = new Set();
+        const trackedSetTimeout = (fn, ms, ...args) => {
+            const id = setTimeout(fn, ms, ...args);
+            timers.add(id);
+            return id;
+        };
+        const trackedSetInterval = (fn, ms, ...args) => {
+            const id = setInterval(fn, ms, ...args);
+            timers.add(id);
+            return id;
+        };
+        const shim =
+            "const setTimeout = trackedSetTimeout; const setInterval = trackedSetInterval; ";
         try {
-            await eval("(async () => {" + programs + "\n" + code + "})()");
+            await eval("(async () => {" + shim + programs + "\n" + code + "})()");
             return "success";
         } catch (err) {
             return err;
+        } finally {
+            for (const id of timers) {
+                clearTimeout(id);
+                clearInterval(id);
+            }
         }
     }
 

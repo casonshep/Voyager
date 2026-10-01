@@ -151,10 +151,13 @@ class VoyagerEnv(gym.Env):
         }
 
         self.unpause()
-        self.mineflayer.stop()
-        time.sleep(1)  # wait for mineflayer to exit
-
-        returned_data = self.check_process()
+        returned_data = None
+        if self.reset_options["reset"] == "soft":
+            returned_data = self.soft_reset()
+        if returned_data is None:
+            self.mineflayer.stop()
+            time.sleep(1)  # wait for mineflayer to exit
+            returned_data = self.check_process()
         self.has_reset = True
         self.connected = True
         # All the reset in step will be soft
@@ -162,6 +165,31 @@ class VoyagerEnv(gym.Env):
         self.pause()
 
         return json.loads(returned_data)
+
+    def soft_reset(self):
+        """Reset the running bot in place instead of restarting mineflayer.
+
+        Returns the observation JSON string, or None when no bot is connected or
+        the in-process reset failed, in which case the caller falls back to a
+        full process restart.
+        """
+        if not (self.connected and self.mineflayer.is_running):
+            return None
+        try:
+            res = requests.post(
+                f"{self.server}/reset",
+                json=self.reset_options,
+                timeout=self.request_timeout,
+            )
+        except requests.RequestException as e:
+            print(f"In-process reset failed ({e}); restarting mineflayer")
+            return None
+        if res.status_code != 200:
+            print(
+                f"In-process reset returned {res.status_code}; restarting mineflayer"
+            )
+            return None
+        return res.json()
 
     def close(self):
         self.unpause()

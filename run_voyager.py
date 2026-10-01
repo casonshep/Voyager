@@ -1,4 +1,5 @@
 import os
+import time
 
 from dotenv import load_dotenv
 
@@ -21,10 +22,19 @@ openai_api_key = os.environ["OPENAI_API_KEY"]
 #     openai_api_key=openai_api_key,
 # )
 
+# Set RESUME=True to continue the run stored in RESUME_CKPT_DIR. With
+# RESUME=False every run gets its own timestamped checkpoint directory, so a
+# stale QA/skill vector store from an earlier run is never reopened.
+RESUME = False
+RESUME_CKPT_DIR = "ckpt"
+ckpt_dir = RESUME_CKPT_DIR if RESUME else f"ckpt_{time.strftime('%Y%m%d_%H%M%S')}"
+print(f"Using checkpoint directory: {ckpt_dir}")
+
 voyager = Voyager(
     mc_port=53202,
     openai_api_key=openai_api_key,
-    resume=False
+    ckpt_dir=ckpt_dir,
+    resume=RESUME,
 )
 
 # start lifelong learning

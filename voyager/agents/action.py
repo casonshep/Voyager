@@ -82,6 +82,7 @@ class ActionAgent:
             "placeItem",
             "smeltItem",
             "killMob",
+            "askJev",
         ]
         if not self.llm.model_name == "gpt-3.5-turbo":
             base_skills += [

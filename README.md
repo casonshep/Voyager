@@ -162,7 +162,19 @@ python scripts/check_typesafe_state.py      # offline sanity check of the state 
 python scripts/typesafe_agreement.py ckpt   # Jev vs GPT critic agreement after a run
 ```
 
-No movement or pathfinding behaviour is touched by these gates.
+Beyond the gates, Jev also steers exploration and is available to generated skills:
+
+| Where | What it does |
+| --- | --- |
+| `exploreUntil` traversal | Every ~10 s of exploration, Jev picks the next compass direction (or up/down/stay) from a terrain survey; pathfinder walks there. Falls back to the original random walk when Jev is unavailable or unsure. |
+| `askJev(bot, question, options, context)` primitive | Generated skills can ask one Choice question about the live game state for judgment calls (which target, whether to retreat, where to place). Returns `{choice, confidence, probabilities}` or `null`; at most 20 calls per program. Exact facts such as inventory checks stay in code. |
+
+Between tasks the bot is reset in place (`POST /reset` on the mineflayer server: stop pathing, clear controls, cancel pvp/collect tasks, reset per-task counters and timers) instead of restarting the Node process. Hard resets and error recovery still restart the process.
+
+```bash
+# Node does not read .env; export the key first (Voyager itself inherits it via load_dotenv).
+cd voyager/env/mineflayer && TYPESAFE_API_KEY=... node scripts/jev_dryrun.js   # traversal + askJev against a canned world, no Minecraft
+```
 
 # FAQ
 If you have any questions, please check our [FAQ](FAQ.md) first before opening an issue.

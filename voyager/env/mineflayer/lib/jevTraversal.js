@@ -1,15 +1,21 @@
-// Jev-based traversal: TypeSafe's Jev model (a System One model returning
-// typed judgments) picks the next waypoint from a snapshot of game state;
-// mineflayer-pathfinder still executes the actual movement. If the SDK or
-// TYPESAFE_API_KEY is unavailable, or Jev is unsure, callers fall back to
-// the old random-walk behavior.
+// Jev integration for the mineflayer bot. TypeSafe's Jev model (a System One
+// model returning typed judgments) is used in two places:
+//   * traversal: pick the next exploration waypoint from a game-state snapshot
+//     (mineflayer-pathfinder still executes the movement), and
+//   * bot.jevAsk: a general Choice question that generated skill code can call
+//     through the askJev control primitive for judgment calls.
+// If the SDK or TYPESAFE_API_KEY is unavailable, or Jev is unsure, callers
+// fall back to plain code paths (random walk, the skill's own fallback).
 const { Vec3 } = require("vec3");
+const { getSurroundingBlocks } = require("./observation/voxels");
 
 const SURVEY_DISTANCE = 16;
 const DECISION_TIMEOUT_MS = 10 * 1000;
 // Below this Choice confidence the distribution is close to flat over the
 // candidates, so the answer carries no real signal.
 const MIN_CONFIDENCE = 0.2;
+// Generated skills may call askJev in loops; cap billed calls per /step.
+const MAX_ASK_CALLS_PER_STEP = 20;
 
 const COMPASS = {
     north: { dx: 0, dz: -1 },
@@ -105,22 +111,7 @@ function gatherState(bot, objective, directionHint) {
     candidates.up = { blockOverhead: above ? above.name : "unknown" };
     candidates.down = { blockUnderfoot: below ? below.name : "unknown" };
 
-    const nearbyEntities = Object.values(bot.entities)
-        .filter(
-            (e) =>
-                e !== bot.entity &&
-                e.position &&
-                e.position.distanceTo(pos) < 32
-        )
-        .slice(0, 10)
-        .map((e) => ({
-            name: e.name || e.username || "unknown",
-            distance: Math.round(e.position.distanceTo(pos)),
-            direction: compassNameOf(
-                e.position.x - pos.x,
-                e.position.z - pos.z
-            ),
-        }));
+    const nearbyEntities = nearbyEntitiesOf(bot);
 
     let hint = "none";
     if (directionHint && (directionHint.x || directionHint.z)) {
@@ -138,19 +129,182 @@ function gatherState(bot, objective, directionHint) {
     return {
         objective: objective || "explore to find useful resources",
         directionHint: hint,
-        bot: {
-            position: {
-                x: Math.floor(pos.x),
-                y: Math.floor(pos.y),
-                z: Math.floor(pos.z),
-            },
-            health: bot.health,
-            food: bot.food,
-            timeOfDay: bot.time ? bot.time.timeOfDay : "unknown",
-        },
+        bot: botVitals(bot),
         nearbyEntities,
         candidates,
     };
+}
+
+// Entities within 32 blocks, nearest first, as Jev-friendly records.
+function nearbyEntitiesOf(bot) {
+    const pos = bot.entity.position;
+    return Object.values(bot.entities)
+        .filter(
+            (e) =>
+                e !== bot.entity &&
+                e.position &&
+                e.position.distanceTo(pos) < 32
+        )
+        .sort((a, b) => a.position.distanceTo(pos) - b.position.distanceTo(pos))
+        .slice(0, 10)
+        .map((e) => ({
+            name: e.name || e.username || "unknown",
+            distance: Math.round(e.position.distanceTo(pos)),
+            direction: compassNameOf(
+                e.position.x - pos.x,
+                e.position.z - pos.z
+            ),
+        }));
+}
+
+function botVitals(bot) {
+    const pos = bot.entity.position;
+    return {
+        position: {
+            x: Math.floor(pos.x),
+            y: Math.floor(pos.y),
+            z: Math.floor(pos.z),
+        },
+        health: bot.health,
+        food: bot.food,
+        timeOfDay: bot.time ? bot.time.timeOfDay : "unknown",
+    };
+}
+
+// item name -> count, so Jev can judge "do I have enough" style context
+// (the exact check still belongs in code; this is background for judgments).
+function inventoryCounts(bot) {
+    const counts = {};
+    if (!bot.inventory) return counts;
+    for (const item of bot.inventory.items()) {
+        if (!item) continue;
+        counts[item.name] = (counts[item.name] || 0) + item.count;
+    }
+    return counts;
+}
+
+function nearbyBlockNames(bot) {
+    try {
+        return Array.from(getSurroundingBlocks(bot, 8, 2, 8));
+    } catch (err) {
+        return [];
+    }
+}
+
+// Normalise the options a skill passes to askJev into Choice criteria.
+// Accepts an array of names or a {name: description|null} object.
+function normaliseOptions(options) {
+    let criteria;
+    if (Array.isArray(options)) {
+        criteria = {};
+        for (const name of options) {
+            if (typeof name !== "string" || !name) {
+                throw new Error("askJev: option names must be non-empty strings");
+            }
+            criteria[name] = null;
+        }
+    } else if (options && typeof options === "object") {
+        criteria = {};
+        for (const [name, description] of Object.entries(options)) {
+            if (description !== null && typeof description !== "string") {
+                throw new Error(
+                    `askJev: description for option "${name}" must be a string or null`
+                );
+            }
+            criteria[name] = description;
+        }
+    } else {
+        throw new Error(
+            "askJev: options must be an array of names or an object of {name: description}"
+        );
+    }
+    if (Object.keys(criteria).length < 2) {
+        throw new Error("askJev: provide at least two options");
+    }
+    return criteria;
+}
+
+// General-purpose Choice question for generated skill code. Resolves to
+//   { choice, confidence, probabilities } when Jev answered with signal,
+//   null when Jev is unavailable, unsure (flat distribution), or errored.
+// Throws only on caller mistakes (bad options, too many calls this step) so
+// the error reaches the action agent as execution feedback.
+async function askJevChoice(bot, question, options, context) {
+    if (typeof question !== "string" || !question.trim()) {
+        throw new Error("askJev: question must be a non-empty string");
+    }
+    const criteria = normaliseOptions(options);
+    if (context !== undefined && context !== null && typeof context !== "object") {
+        throw new Error("askJev: context must be an object of named facts");
+    }
+    bot.jevAskCalls = (bot.jevAskCalls || 0) + 1;
+    if (bot.jevAskCalls > MAX_ASK_CALLS_PER_STEP) {
+        throw new Error(
+            `askJev: called more than ${MAX_ASK_CALLS_PER_STEP} times in one program. ` +
+                "Use askJev for a few judgment calls, not inside loops; " +
+                "use plain code for exact checks."
+        );
+    }
+    const c = getClient();
+    if (!c) return null;
+
+    const state = {
+        question,
+        context: context || {},
+        bot: botVitals(bot),
+        inventory: inventoryCounts(bot),
+        nearbyBlocks: nearbyBlockNames(bot),
+        nearbyEntities: nearbyEntitiesOf(bot),
+    };
+    const request = c.systemOne(
+        {
+            state,
+            questions: {
+                answer: choiceFn(
+                    "A Minecraft bot running an automated skill needs a judgment " +
+                        "call. `question` is what the skill is asking, written by " +
+                        "the skill author. `context` holds facts the skill gathered " +
+                        "for this decision. `bot` is the bot's position, health " +
+                        "(0-20), food (0-20) and time of day (0-24000; night starts " +
+                        "near 13000). `inventory` maps item names to counts. " +
+                        "`nearbyBlocks` are block types within a few blocks, and " +
+                        "`nearbyEntities` are mobs and players within 32 blocks, " +
+                        "nearest first. Which option best answers `question`?",
+                    criteria
+                ),
+            },
+        },
+        { timeout: DECISION_TIMEOUT_MS }
+    );
+    let answer;
+    try {
+        answer = (await request).answers.answer;
+    } catch (err) {
+        console.log("jevAsk: request failed:", err.message);
+        return null;
+    }
+    if (
+        !answer ||
+        typeof answer.choice !== "string" ||
+        typeof answer.confidence !== "number"
+    ) {
+        console.log("jevAsk: unexpected answer shape:", JSON.stringify(answer));
+        return null;
+    }
+    const result = {
+        choice: answer.choice,
+        confidence: answer.confidence,
+        probabilities: answer.probabilities || {},
+    };
+    console.log(
+        `jevAsk: "${question}" -> ${result.choice} ` +
+            `(confidence ${result.confidence.toFixed(2)})`
+    );
+    if (result.confidence < MIN_CONFIDENCE) {
+        console.log("jevAsk: low confidence, returning null");
+        return null;
+    }
+    return result;
 }
 
 async function askJev(bot, objective, directionHint) {
@@ -254,6 +408,15 @@ async function decideNextMove(bot, { objective, direction } = {}) {
 
 function inject(bot) {
     bot.jevNextGoal = (options) => decideNextMove(bot, options);
+    bot.jevAsk = (question, options, context) =>
+        askJevChoice(bot, question, options, context);
+    bot.jevAskCalls = 0;
 }
 
-module.exports = { inject, decideNextMove, gatherState };
+module.exports = {
+    inject,
+    decideNextMove,
+    gatherState,
+    askJevChoice,
+    MAX_ASK_CALLS_PER_STEP,
+};
