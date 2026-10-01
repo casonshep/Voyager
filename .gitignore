@@ -127,3 +127,8 @@ debug_*
 logs/
 plot_iter.py
 *.svg
+
+# claude
+.claude/*
+
+node_modules/*

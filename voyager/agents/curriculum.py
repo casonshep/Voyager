@@ -10,6 +10,8 @@ from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from langchain.schema import HumanMessage, SystemMessage
 from langchain_chroma import Chroma
+from voyager.typesafe import build_state, qa_rank, task_fanout
+from voyager.typesafe.gates import VETO_MESSAGES
 
 class CurriculumAgent:
     def __init__(
@@ -24,7 +26,16 @@ class CurriculumAgent:
         mode="auto",
         warm_up=None,
         core_inventory_items: str | None = None,
+        jev=None,
+        veto_threshold: float = 0.7,
+        qa_keep: int = 5,
+        max_vetoes_per_proposal: int = 2,
     ):
+        # TypeSafe (Jev) gates; None or a disabled client means current behaviour
+        self.jev = jev
+        self.veto_threshold = veto_threshold
+        self.qa_keep = qa_keep
+        self.max_vetoes_per_proposal = max_vetoes_per_proposal
         self.llm = ChatOpenAI(
             model_name=model_name,
             temperature=temperature,
@@ -205,14 +216,19 @@ class CurriculumAgent:
         }
         return observation
 
-    def render_human_message(self, *, events, chest_observation):
+    def _jev_enabled(self) -> bool:
+        return self.jev is not None and getattr(self.jev, "enabled", False)
+
+    def render_human_message(self, *, events, chest_observation, chest_memory=None):
         content = ""
         observation = self.render_observation(
             events=events, chest_observation=chest_observation
         )
         if self.progress >= self.warm_up["context"]:
             questions, answers = self.run_qa(
-                events=events, chest_observation=chest_observation
+                events=events,
+                chest_observation=chest_observation,
+                chest_memory=chest_memory,
             )
             i = 1
             for question, answer in zip(questions, answers):
@@ -236,7 +252,9 @@ class CurriculumAgent:
         print(f"\033[35m****Curriculum Agent human message****\n{content}\033[0m")
         return HumanMessage(content=content)
 
-    def propose_next_task(self, *, events, chest_observation, max_retries=5):
+    def propose_next_task(
+        self, *, events, chest_observation, chest_memory=None, max_retries=5
+    ):
         if self.progress == 0 and self.mode == "auto":
             task = "Mine 1 wood log"
             context = "You can mine one of oak, birch, spruce, jungle, acacia, dark oak, or mangrove logs."
@@ -277,18 +295,30 @@ class CurriculumAgent:
         messages = [
             self.render_system_message(),
             self.render_human_message(
-                events=events, chest_observation=chest_observation
+                events=events,
+                chest_observation=chest_observation,
+                chest_memory=chest_memory,
             ),
         ]
 
         if self.mode == "auto":
-            return self.propose_next_ai_task(messages=messages, max_retries=max_retries)
+            state = None
+            if self._jev_enabled():
+                state = build_state(
+                    events,
+                    chest_memory=chest_memory,
+                    completed_tasks=self.completed_tasks,
+                    failed_tasks=self.failed_tasks,
+                )
+            return self.propose_next_ai_task(
+                messages=messages, state=state, max_retries=max_retries
+            )
         elif self.mode == "manual":
             return self.propose_next_manual_task()
         else:
             raise ValueError(f"Invalid curriculum agent mode: {self.mode}")
 
-    def propose_next_ai_task(self, *, messages, max_retries=5):
+    def propose_next_ai_task(self, *, messages, state=None, max_retries=5, veto_count=0):
         if max_retries == 0:
             raise RuntimeError("Max retries reached, failed to propose ai task.")
         curriculum = self.llm(messages).content
@@ -296,16 +326,97 @@ class CurriculumAgent:
         try:
             response = self.parse_ai_message(curriculum)
             assert "next_task" in response
-            context = self.get_task_context(response["next_task"])
-            return response["next_task"], context
         except Exception as e:
             print(
                 f"\033[35mError parsing curriculum response: {e}. Trying again!\033[0m"
             )
             return self.propose_next_ai_task(
                 messages=messages,
+                state=state,
                 max_retries=max_retries - 1,
+                veto_count=veto_count,
             )
+
+        task = response["next_task"]
+        vetoes = self.judge_proposed_task(task, state, veto_count=veto_count)
+        if vetoes and veto_count < self.max_vetoes_per_proposal and max_retries > 1:
+            reasons = "; ".join(VETO_MESSAGES[name] for name in vetoes)
+            print(f"\033[35mJev vetoed task '{task}': {reasons}. Re-asking.\033[0m")
+            feedback = HumanMessage(
+                content=(
+                    f"The task \"{task}\" was rejected because {reasons}. "
+                    "Propose a different task that follows all the criteria. "
+                    "Respond in the same format."
+                )
+            )
+            return self.propose_next_ai_task(
+                messages=messages + [feedback],
+                state=state,
+                max_retries=max_retries - 1,
+                veto_count=veto_count + 1,
+            )
+        if vetoes:
+            print(
+                f"\033[35mJev veto limit reached; accepting task '{task}' despite: "
+                f"{', '.join(vetoes)}\033[0m"
+            )
+
+        try:
+            context = self.get_task_context(task)
+        except Exception as e:
+            # keep the original retry semantics for a transient QA failure
+            print(
+                f"\033[35mError fetching context for '{task}': {e}. Trying again!\033[0m"
+            )
+            return self.propose_next_ai_task(
+                messages=messages,
+                state=state,
+                max_retries=max_retries - 1,
+                veto_count=veto_count,
+            )
+        return task, context
+
+    def judge_proposed_task(self, task, state, *, veto_count=0):
+        """Run the Jev fan-out on a GPT-proposed task.
+
+        Returns the list of veto ids that fired (possibly empty). Feasibility,
+        verb class, and tool-tier answers are logged only. Any failure returns
+        an empty list so the proposal is accepted as before.
+        """
+        if state is None or not self._jev_enabled():
+            return []
+        try:
+            judged = task_fanout(self.jev, {**state, "task": task})
+        except Exception as e:
+            print(f"\033[31mJev task fan-out failed: {e}\033[0m")
+            return []
+        if judged is None:
+            return []
+        fired = judged.fired(self.veto_threshold)
+        print(
+            f"\033[35mJev task judgment for '{task}': feasibility={judged.feasibility:.2f} "
+            f"(conf {judged.feasibility_confidence:.2f}) verb={judged.verb_class} "
+            f"tool_tier_missing={judged.requires_missing_tool_tier:.2f} "
+            f"vetoes={ {k: round(v, 2) for k, v in judged.vetoes.items()} }\033[0m"
+        )
+        self.jev.log_only(
+            "task_fanout_decisions",
+            {
+                "task": task,
+                "veto_count_before": veto_count,
+                "vetoes": judged.vetoes,
+                "fired": fired,
+                "veto_threshold": self.veto_threshold,
+                "will_reask": bool(fired) and veto_count < self.max_vetoes_per_proposal,
+                "feasibility": judged.feasibility,
+                "feasibility_confidence": judged.feasibility_confidence,
+                "feasibility_probabilities": judged.feasibility_probabilities,
+                "requires_missing_tool_tier": judged.requires_missing_tool_tier,
+                "verb_class": judged.verb_class,
+                "verb_confidence": judged.verb_confidence,
+            },
+        )
+        return fired
 
     def parse_ai_message(self, message):
         task = ""
@@ -380,28 +491,115 @@ class CurriculumAgent:
         print(f"\033[31m****Curriculum Agent task decomposition****\n{response}\033[0m")
         return fix_and_parse_json(response)
 
-    def run_qa(self, *, events, chest_observation):
+    # Chroma distance below which a cached question is reused without asking Jev
+    QA_CACHE_HIT_DISTANCE = 0.05
+    # Upper bound of the gray band in which Jev decides whether two questions match
+    QA_CACHE_GRAY_DISTANCE = 0.3
+    QA_SAME_QUESTION_THRESHOLD = 0.8
+    # run_qa_step1 always prepends three biome questions; they are kept unconditionally
+    QA_FIXED_QUESTIONS = 3
+
+    def _nearest_cached_question(self, question):
+        if self.qa_cache_questions_vectordb._collection.count() == 0:
+            return None, None
+        docs_and_scores = self.qa_cache_questions_vectordb.similarity_search_with_score(
+            question, k=1
+        )
+        if not docs_and_scores:
+            return None, None
+        return docs_and_scores[0][0].page_content, docs_and_scores[0][1]
+
+    def _select_qa_questions(self, questions_new, *, events, chest_memory):
+        """Decide which questions to answer and which cache entries to reuse.
+
+        Returns ``(indices_to_keep, reuse_cached)`` where ``reuse_cached`` maps a
+        question index to the cached question whose answer should be reused.
+        Without Jev every question is kept and only exact-ish cache hits reuse.
+        """
+        neighbours = {}
+        reuse_cached = {}
+        gray = {}
+        for i, question in enumerate(questions_new):
+            cached, distance = self._nearest_cached_question(question)
+            if cached is None:
+                continue
+            neighbours[i] = (cached, distance)
+            if distance < self.QA_CACHE_HIT_DISTANCE:
+                reuse_cached[i] = cached
+            elif distance < self.QA_CACHE_GRAY_DISTANCE:
+                gray[i] = (cached, distance)
+
+        keep = list(range(len(questions_new)))
+        if not self._jev_enabled():
+            return keep, reuse_cached
+
+        try:
+            state = build_state(
+                events,
+                chest_memory=chest_memory,
+                completed_tasks=self.completed_tasks,
+                failed_tasks=self.failed_tasks,
+            )
+            ranked = qa_rank(self.jev, state, questions_new, cached_neighbours=gray)
+        except Exception as e:
+            print(f"\033[31mJev QA ranking failed: {e}\033[0m")
+            ranked = None
+        if ranked is None:
+            return keep, reuse_cached
+
+        fixed = list(range(min(self.QA_FIXED_QUESTIONS, len(questions_new))))
+        generated = [i for i in range(len(questions_new)) if i not in fixed]
+        generated.sort(key=lambda i: ranked.scores[i], reverse=True)
+        keep = fixed + sorted(generated[: self.qa_keep])
+
+        for i, p in ranked.same_as_cached.items():
+            if i in keep and i not in reuse_cached and p >= self.QA_SAME_QUESTION_THRESHOLD:
+                reuse_cached[i] = gray[i][0]
+
+        dropped = [questions_new[i] for i in range(len(questions_new)) if i not in keep]
+        gpt_calls = sum(1 for i in keep if i not in reuse_cached)
+        print(
+            f"\033[35mJev QA gating: keeping {len(keep)}/{len(questions_new)} questions, "
+            f"{len(reuse_cached)} from cache, {gpt_calls} GPT answer calls\033[0m"
+        )
+        self.jev.log_only(
+            "qa_rank_decisions",
+            {
+                "questions": questions_new,
+                "scores": ranked.scores,
+                "kept": [questions_new[i] for i in keep],
+                "dropped": dropped,
+                "reused_from_cache": {questions_new[i]: c for i, c in reuse_cached.items()},
+                "same_as_cached": {questions_new[i]: p for i, p in ranked.same_as_cached.items()},
+                "gpt_answer_calls": gpt_calls,
+                "gpt_answer_calls_saved": len(questions_new) - gpt_calls,
+            },
+        )
+        return keep, reuse_cached
+
+    def run_qa(self, *, events, chest_observation, chest_memory=None):
         questions_new, _ = self.run_qa_step1_ask_questions(
             events=events, chest_observation=chest_observation
         )
+        keep, reuse_cached = self._select_qa_questions(
+            questions_new, events=events, chest_memory=chest_memory
+        )
         questions = []
         answers = []
-        for question in questions_new:
-            if self.qa_cache_questions_vectordb._collection.count() > 0:
-                docs_and_scores = (
-                    self.qa_cache_questions_vectordb.similarity_search_with_score(
-                        question, k=1
-                    )
-                )
-                if docs_and_scores and docs_and_scores[0][1] < 0.05:
-                    question_cached = docs_and_scores[0][0].page_content
-                    assert question_cached in self.qa_cache
-                    answer_cached = self.qa_cache[question_cached]
-                    questions.append(question_cached)
-                    answers.append(answer_cached)
-                    continue
+        for i in keep:
+            question = questions_new[i]
+            if i in reuse_cached:
+                question_cached = reuse_cached[i]
+                assert question_cached in self.qa_cache
+                questions.append(question_cached)
+                answers.append(self.qa_cache[question_cached])
+                continue
+            if question in self.qa_cache:
+                # exact duplicate within this batch or an earlier step
+                questions.append(question)
+                answers.append(self.qa_cache[question])
+                continue
             answer = self.run_qa_step2_answer_questions(question=question)
-            assert question not in self.qa_cache
             self.qa_cache[question] = answer
             self.qa_cache_questions_vectordb.add_texts(
                 texts=[question],
@@ -410,7 +608,7 @@ class CurriculumAgent:
             # self.qa_cache_questions_vectordb.persist()
             questions.append(question)
             answers.append(answer)
-        assert len(questions_new) == len(questions) == len(answers)
+        assert len(questions) == len(answers)
         return questions, answers
 
     def get_task_context(self, task):
