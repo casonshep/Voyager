@@ -22,6 +22,7 @@ class Voyager:
         mc_port: int = None,
         azure_login: Dict[str, str] = None,
         server_port: int = 3000,
+        bot_username: str = "bot",
         openai_api_key: str = None,
         env_wait_ticks: int = 10,
         env_request_timeout: int = 600,
@@ -65,6 +66,7 @@ class Voyager:
         :param mc_port: minecraft in-game port
         :param azure_login: minecraft login config
         :param server_port: mineflayer port
+        :param bot_username: the bot's in-game name (distinct per bot process on a shared server)
         :param openai_api_key: openai api key
         :param env_wait_ticks: how many ticks at the end each step will wait, if you found some chat log missing,
         you should increase this value
@@ -120,6 +122,8 @@ class Voyager:
             azure_login=azure_login,
             server_port=server_port,
             request_timeout=env_request_timeout,
+            log_path=f"./logs/{bot_username}" if bot_username != "bot" else "./logs",
+            bot_username=bot_username,
         )
         self.env_wait_ticks = env_wait_ticks
         self.reset_placed_if_failed = reset_placed_if_failed

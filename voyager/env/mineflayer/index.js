@@ -30,7 +30,7 @@ app.post("/start", (req, res) => {
     bot = mineflayer.createBot({
         host: "localhost", // minecraft server ip
         port: req.body.port, // minecraft server port
-        username: "bot",
+        username: req.body.username || "bot", // each bot process has its own name
         disableChatSigning: true,
         checkTimeoutInterval: 60 * 60 * 1000,
     });
@@ -484,11 +484,33 @@ app.post("/fast/subgoals", async (req, res) => {
     }
     try {
         const body = req.body || {};
-        res.json(await bot.fastLoop.deriveSubgoals(String(body.text || ""), body.target));
+        const override = Array.isArray(body.targets) ? { targets: body.targets } : body.target;
+        const result = await bot.fastLoop.deriveSubgoals(String(body.text || ""), override, body.extraTargets, body.lookahead);
+        if (Array.isArray(body.check)) result.satisfied = await bot.fastLoop.checkSatisfied(body.check);
+        res.json(result);
     } catch (err) {
         console.log("fast/subgoals failed:", err);
         res.status(400).json({ error: String(err && err.message ? err.message : err) });
     }
+});
+
+app.post("/fast/home", (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    const b = req.body || {};
+    bot.fastLoop.setHome(b.x !== undefined ? b : null);
+    res.json({ home: bot.fastLoop.home });
+});
+
+app.post("/fast/say", (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    bot.fastLoop.say((req.body || {}).text);
+    res.json({ ok: true });
 });
 
 app.get("/fast/status", (req, res) => {

@@ -29,7 +29,7 @@ class ActionAgent:
         U.f_mkdir(f"{ckpt_dir}/action")
         if resume:
             print(f"\033[32mLoading Action Agent from {ckpt_dir}/action\033[0m")
-            self.chest_memory = U.load_json(f"{ckpt_dir}/action/chest_memory.json")
+            self.chest_memory = U.json_load_or({}, f"{ckpt_dir}/action/chest_memory.json")
         else:
             self.chest_memory = {}
         self.llm = ChatOpenAI(

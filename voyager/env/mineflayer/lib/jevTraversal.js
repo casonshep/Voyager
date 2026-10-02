@@ -424,6 +424,7 @@ module.exports = {
     // shared with the fast loop (lib/fastLoop.js)
     getClient,
     COMPASS,
+    compassNameOf,
     surveyCandidate,
     nearbyEntitiesOf,
     get choiceFn() {

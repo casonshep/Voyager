@@ -26,6 +26,7 @@ class VoyagerEnv(gym.Env):
         request_timeout=600,
         log_path="./logs",
         pause_server=True,
+        bot_username="bot",
     ):
         if not mc_port and not azure_login:
             raise ValueError("Either mc_port or azure_login must be specified")
@@ -35,6 +36,8 @@ class VoyagerEnv(gym.Env):
             )
         self.mc_port = mc_port
         self.azure_login = azure_login
+        # The in-game name; several bot processes on one server need distinct names.
+        self.bot_username = bot_username
         self.server = f"{server_host}:{server_port}"
         self.server_port = server_port
         self.request_timeout = request_timeout
@@ -146,15 +149,42 @@ class VoyagerEnv(gym.Env):
             raise RuntimeError(f"fast/goal failed: {res.status_code} {res.text[:200]}")
         return res.json()
 
-    def fast_subgoals(self, text: str, target: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Candidate subgoals for a high goal, derived in Node from recipes and the world."""
+    def fast_subgoals(
+        self, text: str, target: Dict[str, Any] = None, check=None, targets=None, extra_targets=None, lookahead=None
+    ) -> Dict[str, Any]:
+        """Candidate subgoals for a high goal, derived in Node from recipes and the world.
+
+        ``check`` is a list of extra goal targets (remembered skills); the reply's
+        ``satisfied`` list says which of them are already met right now.
+        """
         payload: Dict[str, Any] = {"text": text}
         if target:
             payload["target"] = target
+        if check:
+            payload["check"] = check
+        if targets:
+            payload["targets"] = targets  # explicit [{item, count}] decomposition to plan from
+        if extra_targets:
+            payload["extraTargets"] = extra_targets  # requirements learned during execution
+        if lookahead:
+            payload["lookahead"] = lookahead  # next milestone's targets, planned alongside
         res = requests.post(f"{self.server}/fast/subgoals", json=payload, timeout=60)
         if res.status_code != 200:
             raise RuntimeError(f"fast/subgoals failed: {res.status_code} {res.text[:200]}")
         return res.json()
+
+    def fast_home(self, pos: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Tell the fast loop where the home base is (or clear it with None)."""
+        res = requests.post(f"{self.server}/fast/home", json=pos or {}, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/home failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_say(self, text: str) -> None:
+        """Have the bot say a line in chat (a short acknowledgement to players)."""
+        res = requests.post(f"{self.server}/fast/say", json={"text": text}, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/say failed: {res.status_code} {res.text[:200]}")
 
     def fast_status(self) -> Dict[str, Any]:
         """Drain the fast loop's triggers and observations since the last poll."""
@@ -193,6 +223,7 @@ class VoyagerEnv(gym.Env):
 
         self.reset_options = {
             "port": self.mc_port,
+            "username": self.bot_username,
             "reset": options.get("mode", "hard"),
             "inventory": options.get("inventory", {}),
             "equipment": options.get("equipment", []),

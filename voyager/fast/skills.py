@@ -1,14 +1,20 @@
-"""Skills in fast mode: one record per completed subgoal.
+"""Skill tree for fast mode.
 
-A skill is a subgoal that was completed while working toward a high goal.
-It stores what was being attempted (high goal and subgoal), how long it
-took, which tools were held, and the primitive sequence that worked, keyed
-by the coarse world fingerprint it started from (biome class, pickaxe tier,
-day/night). Skills are the candidate set the brain offers Jev when choosing
-the next subgoal; a bot starts with none and accumulates them as it goes.
+A **skill** is a goal the bot has verified reaching: a node identified by
+its goal target (``item`` + count family, ``nearBlock``, or a judged goal).
+Every node carries a ``verify`` spec so code can ask Node whether the goal
+is already satisfied by the current world. High goals become nodes when
+reached, and are connected to the subgoal nodes that were used on the way,
+so the tree records *how* each goal was reached from earlier ones:
 
-Records live in ``<ckpt_dir>/fast/skills.json`` so they can be inspected and
-extended later (the record is a plain dict; add fields freely).
+    Craft a wooden pickaxe  (high)
+      +-- Obtain 3 oak_planks (sub)
+      +-- Obtain 2 stick      (sub)
+
+Per node, ``routes`` keeps the primitive sequence that worked in each coarse
+world fingerprint (biome class, pickaxe tier, day/night) for replay, plus
+timing and the tools held. Records are plain dicts in
+``<ckpt_dir>/fast/skills.json`` so fields can be added later.
 """
 
 from __future__ import annotations
@@ -17,6 +23,12 @@ import json
 import os
 import time
 from typing import Any
+
+
+import re
+
+# what counts as a tool on a skill record (the held item is otherwise whatever was last used)
+TOOL_RE = re.compile(r"_(pickaxe|axe|sword|shovel|hoe)$|^(shears|flint_and_steel|bucket|bow|crossbow|fishing_rod|shield)$")
 
 
 def fingerprint_key(fingerprint: dict | None) -> str:
@@ -32,14 +44,42 @@ def expand(collapsed: list[dict]) -> list[str]:
 
 
 def target_key(target: dict | None) -> str:
-    """Stable key for a goal target override or summary."""
-    if not target:
+    """Stable identity of a goal: what has to be true for it to count as reached."""
+    if not target or target.get("none"):
         return "none"
-    if target.get("none"):
-        return "none"
+    if target.get("milestone"):
+        return f"milestone:{target['milestone']}"
     if target.get("nearBlock"):
         return f"near:{target['nearBlock']}"
+    if target.get("dimension"):
+        return f"dimension:{target['dimension']}"
+    if target.get("nearPlayer"):
+        return f"player:{target['nearPlayer']}"
+    if target.get("give"):
+        return f"give:{target['give'].get('item')}:{target['give'].get('to')}"
+    if target.get("judged"):
+        return "none"
     return str(target.get("item") or "none")
+
+
+def verify_spec(target: dict | None) -> dict[str, Any]:
+    """How to check this goal against the world. ``judged`` goals need a Jev Noul."""
+    if not target or target.get("none"):
+        return {"kind": "judged"}
+    if target.get("milestone"):
+        return {"kind": "milestone", "targets": list(target.get("targets") or [])}
+    if target.get("nearBlock"):
+        return {"kind": "nearBlock", "block": target["nearBlock"]}
+    if target.get("dimension"):
+        return {"kind": "dimension", "dimension": target["dimension"]}
+    if target.get("nearPlayer"):
+        return {"kind": "nearPlayer", "player": target["nearPlayer"], "distance": int(target.get("distance", 3))}
+    if target.get("give"):
+        g = target["give"]
+        return {"kind": "give", "item": g.get("item"), "count": int(g.get("count", 1)), "to": g.get("to")}
+    if target.get("judged"):
+        return {"kind": "judged"}
+    return {"kind": "item", "item": target.get("item"), "count": int(target.get("count", 1))}
 
 
 class SkillMemory:
@@ -54,81 +94,134 @@ class SkillMemory:
                 print(f"\033[31mSkillMemory: could not load {path}: {exc}\033[0m")
                 self.skills = {}
 
+    # ---- identity ----------------------------------------------------------
     @staticmethod
-    def key(target: dict | None, fingerprint: dict | None) -> str:
-        return f"{target_key(target)}|{fingerprint_key(fingerprint)}"
+    def node_id(goal_text: str, target: dict | None) -> str:
+        key = target_key(target)
+        if key == "none":
+            # judged goals are identified by their text
+            return "judged:" + " ".join(goal_text.lower().split())
+        return key
 
+    def node(self, goal_text: str, target: dict | None) -> dict[str, Any] | None:
+        return self.skills.get(self.node_id(goal_text, target))
+
+    def known(self, goal_text: str, target: dict | None) -> bool:
+        """Has this goal already been reached as a high goal before?"""
+        n = self.node(goal_text, target)
+        return bool(n and n.get("kind") == "high")
+
+    # ---- recording -----------------------------------------------------------
     def record(
         self,
         *,
-        high_goal: str,
-        subgoal: str,
+        goal: str,
         target: dict | None,
+        kind: str,
+        high_goal: str | None,
         fingerprint: dict | None,
         seconds: float,
         trace: list[dict],
         collapsed: list[dict],
         inventory_before: dict | None,
         inventory_after: dict | None,
+        children: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Store a completed subgoal. Returns the skill record."""
-        key = self.key(target, fingerprint)
-        tools = sorted({s["tool"] for s in trace if s.get("tool")})
+        """Store a reached goal as a node (or update it) and return the node."""
+        nid = self.node_id(goal, target)
+        fk = fingerprint_key(fingerprint)
+        tools = sorted({s["tool"] for s in trace if s.get("tool") and TOOL_RE.search(s["tool"])})
         actions = expand(collapsed)
         delta = {}
         for item in sorted(set(inventory_before or {}) | set(inventory_after or {})):
             change = int((inventory_after or {}).get(item, 0)) - int((inventory_before or {}).get(item, 0))
             if change:
                 delta[item] = change
-        existing = self.skills.get(key)
-        if existing:
-            existing["successes"] += 1
-            existing["attempts"] += 1
-            existing["high_goals"] = sorted(set(existing.get("high_goals", [])) | {high_goal})
-            existing["tools_used"] = sorted(set(existing.get("tools_used", [])) | set(tools))
-            existing["last_seconds"] = round(seconds, 1)
-            existing["last_used"] = time.time()
-            # keep the shortest primitive sequence that worked
-            if actions and (not existing.get("actions") or len(actions) < len(existing["actions"])):
-                existing["actions"] = actions
-                existing["seconds"] = round(seconds, 1)
-            skill = existing
-        else:
-            skill = {
-                "id": key,
-                "subgoal": subgoal,
+        now = time.time()
+        node = self.skills.get(nid)
+        if node is None:
+            node = {
+                "id": nid,
+                "goal": goal,
+                "verify": verify_spec(target),
                 "target": target,
-                "high_goal": high_goal,
-                "high_goals": [high_goal],
+                "kind": kind,
+                "high_goals": [],
+                "children": [],
+                "parents": [],
+                "routes": {},
+                "tools_used": [],
                 "seconds": round(seconds, 1),
                 "last_seconds": round(seconds, 1),
-                "tools_used": tools,
-                "actions": actions,
-                "fingerprint": fingerprint,
                 "inventory_delta": delta,
-                "attempts": 1,
-                "successes": 1,
+                "attempts": 0,
+                "successes": 0,
                 "failures": 0,
-                "created": time.time(),
-                "last_used": time.time(),
+                "created": now,
+                "last_used": now,
             }
-            self.skills[key] = skill
+            self.skills[nid] = node
+        if kind == "high":
+            node["kind"] = "high"  # a subgoal node can be promoted to a learned high goal
+        if high_goal and high_goal not in node["high_goals"]:
+            node["high_goals"].append(high_goal)
+        node["attempts"] += 1
+        node["successes"] += 1
+        node["tools_used"] = sorted(set(node["tools_used"]) | set(tools))
+        node["last_seconds"] = round(seconds, 1)
+        node["last_used"] = now
+        if not node.get("inventory_delta"):
+            node["inventory_delta"] = delta
+        route = node["routes"].get(fk)
+        if actions and (route is None or len(actions) < len(route["actions"])):
+            node["routes"][fk] = {
+                "fingerprint": fingerprint,
+                "actions": actions,
+                "seconds": round(seconds, 1),
+                "tools": tools,
+            }
+            node["seconds"] = round(seconds, 1)
+        for child in children or []:
+            if child != nid and child in self.skills:
+                self.connect(nid, child)
         self._save()
-        return skill
+        return node
 
-    def note_failure(self, target: dict | None, fingerprint: dict | None) -> None:
-        skill = self.skills.get(self.key(target, fingerprint))
-        if skill:
-            skill["attempts"] += 1
-            skill["failures"] += 1
+    def connect(self, parent_id: str, child_id: str) -> None:
+        parent = self.skills.get(parent_id)
+        child = self.skills.get(child_id)
+        if not parent or not child:
+            return
+        if child_id not in parent["children"]:
+            parent["children"].append(child_id)
+        if parent_id not in child["parents"]:
+            child["parents"].append(parent_id)
+
+    def note_failure(self, goal: str, target: dict | None) -> None:
+        node = self.node(goal, target)
+        if node:
+            node["attempts"] += 1
+            node["failures"] += 1
             self._save()
 
-    def matching(self, fingerprint: dict | None) -> list[dict[str, Any]]:
-        """Skills learned in this coarse situation, most reliable first."""
-        fk = fingerprint_key(fingerprint)
-        out = [s for s in self.skills.values() if fingerprint_key(s.get("fingerprint")) == fk]
-        out.sort(key=lambda s: (-(s["successes"] - s["failures"]), s["seconds"]))
-        return out
+    # ---- lookup ----------------------------------------------------------------
+    def route_for(self, target: dict | None, fingerprint: dict | None, goal_text: str = "") -> list[str] | None:
+        """Primitive replay for this goal in this situation, if one was learned."""
+        node = self.node(goal_text, target)
+        if not node:
+            return None
+        route = node["routes"].get(fingerprint_key(fingerprint))
+        return list(route["actions"]) if route else None
+
+    def describe(self, node: dict[str, Any], fingerprint: dict | None) -> str:
+        """Short history line for a subgoal candidate note."""
+        route = node["routes"].get(fingerprint_key(fingerprint))
+        where = "here" if route else "elsewhere"
+        tools = ", ".join(node["tools_used"]) or "no tools"
+        return (
+            f"known skill: reached {node['successes']} time(s), failed {node['failures']}, "
+            f"about {node['seconds']}s using {tools}, learned {where}"
+        )
 
     def _save(self) -> None:
         try:

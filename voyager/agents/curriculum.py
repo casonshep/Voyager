@@ -58,11 +58,11 @@ class CurriculumAgent:
         U.f_mkdir(f"{ckpt_dir}/curriculum/vectordb")
         if resume:
             print(f"\033[35mLoading Curriculum Agent from {ckpt_dir}/curriculum\033[0m")
-            self.completed_tasks = U.load_json(
-                f"{ckpt_dir}/curriculum/completed_tasks.json"
+            self.completed_tasks = U.json_load_or(
+                [], f"{ckpt_dir}/curriculum/completed_tasks.json"
             )
-            self.failed_tasks = U.load_json(f"{ckpt_dir}/curriculum/failed_tasks.json")
-            self.qa_cache = U.load_json(f"{ckpt_dir}/curriculum/qa_cache.json")
+            self.failed_tasks = U.json_load_or([], f"{ckpt_dir}/curriculum/failed_tasks.json")
+            self.qa_cache = U.json_load_or({}, f"{ckpt_dir}/curriculum/qa_cache.json")
         else:
             self.completed_tasks = []
             self.failed_tasks = []
@@ -227,6 +227,13 @@ class CurriculumAgent:
         observation = self.render_observation(
             events=events, chest_observation=chest_observation
         )
+        long_term_goal = getattr(self, "long_term_goal", None)
+        if long_term_goal:
+            content += (
+                f"Long-term goal: {long_term_goal}\n"
+                "When several next tasks are reasonable, prefer the one that moves toward "
+                "the long-term goal, but keep the next task small and achievable now.\n\n"
+            )
         if self.progress >= self.warm_up["context"]:
             questions, answers = self.run_qa(
                 events=events,
@@ -256,8 +263,14 @@ class CurriculumAgent:
         return HumanMessage(content=content)
 
     def propose_next_task(
-        self, *, events, chest_observation, chest_memory=None, max_retries=5
+        self, *, events, chest_observation, chest_memory=None, max_retries=5, extra_feedback=None
     ):
+        """Propose the next task.
+
+        ``extra_feedback`` is an optional message appended to the prompt, used by
+        the fast brain to send back tasks it rejected (already learned, or already
+        satisfied by the inventory) so the next proposal is different.
+        """
         if self.progress == 0 and self.mode == "auto":
             task = "Mine 1 wood log"
             context = "You can mine one of oak, birch, spruce, jungle, acacia, dark oak, or mangrove logs."
@@ -303,6 +316,8 @@ class CurriculumAgent:
                 chest_memory=chest_memory,
             ),
         ]
+        if extra_feedback:
+            messages.append(HumanMessage(content=extra_feedback))
 
         if self.mode == "auto":
             state = None

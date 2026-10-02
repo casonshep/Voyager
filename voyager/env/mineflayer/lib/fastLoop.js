@@ -19,6 +19,16 @@ const path = require("path");
 const { Vec3 } = require("vec3");
 const { getSurroundingBlocks } = require("./observation/voxels");
 const traversal = require("./jevTraversal");
+const { ORE_DROPS, SMELTABLE, FUELS, PICKAXE_TIER, EDIBLE, FAMILIES } = require("./mcKnowledge");
+// Jump-and-place pillaring. The server only accepts a placement while the bot
+// is a full block above the target and the packet arrives inside that window
+// (about four ticks near the top of the jump), so the placement is re-sent on
+// every tick of the window rather than once per jump. The pathfinder's own
+// towering sends once at lift-off and succeeds by luck after many jumps, so
+// it is switched off (see configurePathfinder) and this pillar is used instead.
+const ENABLE_PILLAR = true;
+const PILLAR_WINDOW_Y = 1.0; // blocks above the old feet level before a placement is valid
+const PILLAR_SENDS_PER_JUMP = 4;
 
 const DECISION_TIMEOUT_MS = 4000;
 const WALK_DISTANCE = 12;
@@ -28,8 +38,10 @@ const CRAFT_TIMEOUT_MS = 20000;
 const ATTACK_TIMEOUT_S = 20;
 // No-progress fires on whichever comes first: wall clock or a run of
 // actions without a target gain (decisions are fast, so count them too).
-const NO_PROGRESS_DEFAULT_S = 30;
-const NO_PROGRESS_DEFAULT_ACTIONS = 5;
+// Generous on purpose: exploring, surfacing and far mining produce no target
+// gain for a while even when they are going well. Three stalls fail a high goal.
+const NO_PROGRESS_DEFAULT_S = 120;
+const NO_PROGRESS_DEFAULT_ACTIONS = 12;
 const MAX_SUBGOAL_CANDIDATES = 8;
 const STUCK_WINDOW_ACTIONS = 4;
 const STUCK_DISTANCE = 1.5;
@@ -45,12 +57,6 @@ const HOSTILE = new Set([
     "vindicator", "zombie_villager", "silverfish", "blaze", "ghast",
 ]);
 const FOOD_MOBS = new Set(["cow", "pig", "sheep", "chicken", "rabbit"]);
-const EDIBLE = [
-    "cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken",
-    "bread", "apple", "baked_potato", "cooked_cod", "cooked_salmon",
-    "beef", "porkchop", "mutton", "chicken", "carrot", "potato", "melon_slice",
-    "sweet_berries", "rotten_flesh",
-];
 // Items worth offering as craft options when their recipe is currently
 // satisfiable. The goal target is always added when craftable.
 const CRAFT_LADDER = [
@@ -61,36 +67,33 @@ const CRAFT_LADDER = [
     "torch", "iron_pickaxe", "iron_sword", "iron_axe", "shield", "chest",
     "bucket", "shears",
 ];
-const ORE_DROPS = {
-    coal_ore: "coal", deepslate_coal_ore: "coal",
-    iron_ore: "raw_iron", deepslate_iron_ore: "raw_iron",
-    copper_ore: "raw_copper", deepslate_copper_ore: "raw_copper",
-    gold_ore: "raw_gold", deepslate_gold_ore: "raw_gold",
-    diamond_ore: "diamond", deepslate_diamond_ore: "diamond",
-    lapis_ore: "lapis_lazuli", deepslate_lapis_ore: "lapis_lazuli",
-    redstone_ore: "redstone", deepslate_redstone_ore: "redstone",
-    emerald_ore: "emerald", deepslate_emerald_ore: "emerald",
-    stone: "cobblestone", deepslate: "cobbled_deepslate", grass_block: "dirt",
-};
-const PICKAXE_TIER = ["wooden", "stone", "iron", "diamond", "netherite"];
-const FUELS = ["coal", "charcoal", "oak_planks", "spruce_planks", "birch_planks",
-    "jungle_planks", "acacia_planks", "dark_oak_planks", "oak_log", "spruce_log",
-    "birch_log", "jungle_log", "acacia_log", "dark_oak_log", "stick"];
-const SMELTABLE = { raw_iron: "iron_ingot", raw_copper: "copper_ingot", raw_gold: "gold_ingot",
-    beef: "cooked_beef", porkchop: "cooked_porkchop", mutton: "cooked_mutton",
-    chicken: "cooked_chicken", cobblestone: "stone", sand: "glass" };
 // Blocks worth pillaring with, cheapest first.
 const PILLAR_BLOCKS = ["dirt", "cobblestone", "netherrack", "cobbled_deepslate", "andesite", "diorite",
     "granite", "oak_planks", "spruce_planks", "birch_planks", "stone", "sand", "gravel"];
 const PILLAR_HEIGHT = 6;
-// Things nobody needs more than a stack of; deposited when the bag is nearly full.
-const JUNK = ["dirt", "cobblestone", "gravel", "sand", "andesite", "diorite", "granite", "cobbled_deepslate",
-    "wheat_seeds", "rotten_flesh", "flint", "string", "bone", "spider_eye", "gunpowder", "oak_sapling",
-    "birch_sapling", "spruce_sapling", "stick", "tuff", "netherrack", "clay_ball", "kelp", "seagrass"];
-const JUNK_KEEP = 16; // how many of a junk item to keep when depositing
-const INVENTORY_FULL = 30; // used slots (of 36) that make chest:deposit worth offering
+const PILLAR_RETRY_MS = 90 * 1000; // after a pillar that placed nothing, do not offer it again for a while
+// Inventory policy, in code: what is worth carrying and how much. Everything
+// else is junk and goes into a chest when one is reachable, or on the ground
+// when the bag is nearly full underground.
+const KEEP_ALL_RE =
+    /_(pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots)$|^raw_|_ingot$|_nugget$|^diamond$|^emerald$|^lapis_lazuli$|^redstone$|^torch$|^bucket$|^water_bucket$|^lava_bucket$|^flint$|^flint_and_steel$|^obsidian$|^ender_pearl$|^ender_eye$|^blaze_rod$|^blaze_powder$|^string$|^bone$|^arrow$|^bow$|^shield$|_bed$|^gunpowder$|^leather$|_wool$|^shears$|^book$|^paper$|^sugar_cane$|^glass$|^iron_block$|^gold_block$|^diamond_block$/;
+const KEEP_CAP = { cobblestone: 32, coal: 64, charcoal: 32, stick: 32, "family:log": 32, "family:planks": 32, crafting_table: 1, furnace: 1, chest: 2 };
+const INVENTORY_DEPOSIT_AT = 24; // used slots (of 36) from which a chest deposit is offered
+const INVENTORY_DISCARD_AT = 30; // used slots from which junk is tossed when no chest is near
+const INVENTORY_SLOTS = 36;
+const CHEST_REACH = 48; // how far a known chest may be to offer withdraw/deposit
+// Batch smelting: load the furnace with everything to cook plus fuel, leave,
+// do something else, come back for the output. Vanilla: 10 s per item.
+const SMELT_SECONDS_PER_ITEM = 10;
+const FUEL_ITEMS_PER_UNIT = { coal: 8, charcoal: 8, lava_bucket: 100, blaze_rod: 12, oak_log: 1.5, spruce_log: 1.5, birch_log: 1.5,
+    jungle_log: 1.5, acacia_log: 1.5, dark_oak_log: 1.5, oak_planks: 1.5, spruce_planks: 1.5, birch_planks: 1.5,
+    jungle_planks: 1.5, acacia_planks: 1.5, dark_oak_planks: 1.5, stick: 0.5 };
+const FURNACE_MAX_BATCH = 64;
 const LANDMARK_BLOCKS = ["crafting_table", "furnace", "chest"];
 const COLLECT_DISTANCE = 12;
+// The server sends the world age every 20 ticks; when it stops changing for
+// this long the server is paused (/pause from the Fabric mod) and the loop idles.
+const SERVER_PAUSE_DETECT_MS = 2500;
 const NO_TARGET_VERB_RE =
     /^\s*(place|put|equip|wear|deposit|store|eat|consume|kill|hunt|explore|find|build|use|sleep|plant|drink)\b/i;
 const RESOURCE_BLOCK_RE =
@@ -103,6 +106,9 @@ function withTimeout(promise, ms, label) {
     const timeout = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
     });
+    // a primitive that loses the race keeps running until cancelled; its
+    // eventual rejection (usually "Path was stopped") is not an error of ours
+    Promise.resolve(promise).catch(() => {});
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
@@ -142,16 +148,36 @@ function loadPrimitives(bot, mcData) {
 // names; suffix classes (log, planks, pickaxe) match a family. Several
 // equally good candidates are resolved by a Jev Choice; code owns the count.
 // ---------------------------------------------------------------------------
-function normaliseText(text) {
-    return ` ${String(text)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
-        .replace(/\b([a-z]+)s\b/g, "$1")} `;
+// Plural handling: "torches" must match torch, "pickaxes" pickaxe, "boots" boots.
+// Text words are tried in several forms; item words are compared with a
+// trailing s removed, so both sides meet in the middle.
+function wordForms(w) {
+    const forms = new Set([w]);
+    if (w.endsWith("s")) forms.add(w.slice(0, -1));
+    if (w.endsWith("es")) forms.add(w.slice(0, -2));
+    if (w.endsWith("ies")) forms.add(w.slice(0, -3) + "y");
+    return forms;
+}
+
+function textTokens(text) {
+    return String(text).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/).filter(Boolean);
+}
+
+// Does the item/block `name` (oak_log, iron_boots) appear as consecutive words in `tokens`?
+function phraseIn(tokens, name) {
+    const words = name.split("_").map((w) => w.replace(/s$/, ""));
+    outer: for (let i = 0; i + words.length <= tokens.length; i++) {
+        for (let j = 0; j < words.length; j++) {
+            if (!wordForms(tokens[i + j]).has(words[j])) continue outer;
+        }
+        return true;
+    }
+    return false;
 }
 
 function findTargetCandidates(text, mcData) {
-    const norm = normaliseText(text);
-    const words = new Set(norm.trim().split(/\s+/));
+    const tokens = textTokens(text);
+    const words = new Set(tokens.flatMap((t) => [...wordForms(t)]));
     const exact = [];
     const classes = new Map();
     const allNames = new Set([
@@ -159,8 +185,7 @@ function findTargetCandidates(text, mcData) {
         ...Object.keys(mcData.blocksByName),
     ]);
     for (const name of allNames) {
-        const phrase = ` ${name.replace(/_/g, " ").replace(/\b([a-z]+)s\b/g, "$1")} `;
-        if (norm.includes(phrase)) exact.push(name);
+        if (phraseIn(tokens, name)) exact.push(name);
         const suffix = name.split("_").pop().replace(/s$/, "");
         if (name.includes("_") && words.has(suffix)) {
             if (!classes.has(suffix)) classes.set(suffix, []);
@@ -213,6 +238,10 @@ function matcherFor(key) {
         const suffix = key.slice(2);
         return (x) => x === suffix || x.endsWith(`_${suffix}`);
     }
+    if (key.startsWith("family:")) {
+        const members = new Set(FAMILIES[key.slice(7)] || []);
+        return (x) => members.has(x);
+    }
     return (x) => x === key;
 }
 
@@ -222,6 +251,7 @@ class FastLoop {
         this.bot = bot;
         this.mcData = require("minecraft-data")(bot.version);
         this.prims = loadPrimitives(bot, this.mcData);
+        this.configurePathfinder();
         this.active = false;
         this.runPromise = null;
         this.goal = null;
@@ -244,6 +274,187 @@ class FastLoop {
         this.highGoalReached = false;
         this._recipes = null;
         this.landmarks = {}; // block name -> {x, y, z} of the last one seen; kept across goals
+        this.serverPaused = false;
+        this._lastAge = null;
+        this._lastAgeChangeAt = Date.now();
+        this.decisionLog = []; // recent Jev decisions, drained by status()
+        this._lastDecisionAt = null;
+        this.home = null; // {x, y, z} of the home base (crafting table, furnace, chest), set by the brain
+        this.furnaceJobs = []; // batches cooking: {pos, input, output, count, loadedAt, readyAt}
+        this.playerChat = []; // chat lines from players since the last status poll, drained by status()
+        this.listenForPlayers();
+    }
+
+    // ---- player chat -------------------------------------------------------
+    // Lines typed by players reach the brain through status().chat. Lines from
+    // this bot and from sibling bots (same name stem, e.g. bot, bot2, bot3) are
+    // dropped: a sibling's "I need a stone pickaxe" must not look like a command.
+    isBotName(name) {
+        const own = String(this.bot.username || "bot");
+        const stem = own.replace(/\d+$/, "") || own;
+        return name === own || new RegExp("^" + stem + "[0-9]*$").test(String(name || ""));
+    }
+
+    listenForPlayers() {
+        const client = this.bot._client;
+        if (!client || typeof client.on !== "function") return; // dry-run stubs without a protocol client
+        // The protocol-level player_chat packet carries only real player messages.
+        // mineflayer's "chat" event also fires on server feedback such as
+        // "[name: Teleported bot to name]", which must not look like a command.
+        client.on("playerChat", (data) => {
+            const text = String(data.plainMessage || "").trim();
+            if (!text || text.startsWith("/")) return;
+            const username = this.playerNameByUuid(data.sender) || data.senderName || "";
+            if (!username || this.isBotName(username)) return;
+            this.playerChat.push({ from: username, text, at: Date.now() });
+            if (this.playerChat.length > 20) this.playerChat.shift();
+            console.log(`fastLoop: chat from ${username}: ${text}`);
+        });
+    }
+
+    playerNameByUuid(uuid) {
+        if (!uuid) return null;
+        for (const [name, p] of Object.entries(this.bot.players || {})) {
+            if (p && p.uuid === uuid) return name;
+        }
+        return null;
+    }
+
+    say(text) {
+        const line = String(text || "").slice(0, 240);
+        if (!line) return;
+        try {
+            this.bot.chat(line);
+        } catch (err) {
+            console.log("fastLoop: chat failed:", err.message);
+        }
+    }
+
+    // ---- batch smelting ----------------------------------------------------
+    pendingOutput(matches) {
+        return this.furnaceJobs.filter((j) => matches(j.output)).reduce((s, j) => s + j.count, 0);
+    }
+
+    jobsFor(matches) {
+        return this.furnaceJobs.filter((j) => !matches || matches(j.output));
+    }
+
+    // Load a furnace with up to `count` of `raw` and enough fuel, then leave it cooking.
+    async smeltBatch(raw, count) {
+        const bot = this.bot;
+        const { goals } = require("mineflayer-pathfinder");
+        const furnaceBlock = bot.findBlock({ matching: this.mcData.blocksByName.furnace.id, maxDistance: 32 });
+        if (!furnaceBlock) return "failed: no furnace nearby";
+        const inv = this.inventoryCounts();
+        const have = inv[raw] || 0;
+        if (!have) return `failed: no ${raw} to smelt`;
+        const n = Math.min(have, count, FURNACE_MAX_BATCH);
+        const fuelName = Object.keys(FUEL_ITEMS_PER_UNIT).sort((a, b) => FUEL_ITEMS_PER_UNIT[b] - FUEL_ITEMS_PER_UNIT[a]).find((f) => inv[f]);
+        if (!fuelName) return "failed: no fuel";
+        try {
+            await withTimeout(bot.pathfinder.goto(new goals.GoalLookAtBlock(furnaceBlock.position, bot.world)), WALK_TIMEOUT_MS * 2, "walk to furnace");
+        } catch (err) {
+            return `failed: could not reach the furnace (${err.message.split("\n")[0].slice(0, 40)})`;
+        }
+        const furnace = await withTimeout(bot.openFurnace(furnaceBlock), 8000, "open furnace");
+        try {
+            if (furnace.outputItem && furnace.outputItem()) await furnace.takeOutput(); // whatever finished earlier
+            const existing = furnace.inputItem ? furnace.inputItem() : null;
+            if (existing && existing.name !== raw) return `failed: furnace is busy with ${existing.name}`;
+            const fuelNeeded = Math.max(0, Math.ceil(n / FUEL_ITEMS_PER_UNIT[fuelName]) - ((furnace.fuelItem && furnace.fuelItem()) ? furnace.fuelItem().count : 0));
+            if (fuelNeeded > 0) await furnace.putFuel(this.mcData.itemsByName[fuelName].id, null, Math.min(fuelNeeded, inv[fuelName]));
+            await furnace.putInput(this.mcData.itemsByName[raw].id, null, n);
+        } finally {
+            try {
+                furnace.close();
+            } catch (err) {
+                /* ignore */
+            }
+        }
+        const output = SMELTABLE[raw];
+        const pos = furnaceBlock.position.clone();
+        const job = this.furnaceJobs.find((j) => j.pos.equals(pos));
+        const now = Date.now();
+        if (job) {
+            job.count += n;
+            job.readyAt = Math.max(job.readyAt, now) + n * SMELT_SECONDS_PER_ITEM * 1000;
+        } else {
+            this.furnaceJobs.push({ pos, input: raw, output, count: n, loadedAt: now, readyAt: now + n * SMELT_SECONDS_PER_ITEM * 1000 });
+        }
+        const readyIn = Math.round(n * SMELT_SECONDS_PER_ITEM);
+        this.pushTrigger("smelt_queued", { input: raw, output, count: n, readyInSeconds: readyIn, position: { x: pos.x, y: pos.y, z: pos.z } });
+        return `ok, ${n} ${raw} cooking (${readyIn}s)`;
+    }
+
+    // Take finished output from a furnace with a job; waits a bounded time if it is not done yet.
+    async collectFurnace(isAborted) {
+        const bot = this.bot;
+        const { goals } = require("mineflayer-pathfinder");
+        const here = bot.entity.position;
+        const job = [...this.furnaceJobs].sort((a, b) => a.pos.distanceTo(here) - b.pos.distanceTo(here))[0];
+        if (!job) return "failed: nothing is cooking";
+        const block = bot.blockAt(job.pos);
+        if (!block || block.name !== "furnace") {
+            this.furnaceJobs = this.furnaceJobs.filter((j) => j !== job);
+            return "failed: the furnace is gone";
+        }
+        try {
+            await withTimeout(bot.pathfinder.goto(new goals.GoalLookAtBlock(job.pos, bot.world)), WALK_TIMEOUT_MS * 3, "walk to furnace");
+        } catch (err) {
+            return `failed: could not reach the furnace (${err.message.split("\n")[0].slice(0, 40)})`;
+        }
+        const wait = Math.min(Math.max(0, job.readyAt - Date.now()), 45000);
+        if (wait > 0 && !isAborted()) await sleep(wait);
+        const furnace = await withTimeout(bot.openFurnace(block), 8000, "open furnace");
+        let taken = 0;
+        try {
+            for (let i = 0; i < 8; i++) {
+                const out = furnace.outputItem ? furnace.outputItem() : null;
+                if (!out) break;
+                taken += out.count;
+                await furnace.takeOutput();
+                await sleep(100);
+            }
+            const left = furnace.inputItem ? furnace.inputItem() : null;
+            if (!left) this.furnaceJobs = this.furnaceJobs.filter((j) => j !== job);
+            else {
+                job.count = left.count;
+                job.readyAt = Date.now() + left.count * SMELT_SECONDS_PER_ITEM * 1000;
+            }
+        } finally {
+            try {
+                furnace.close();
+            } catch (err) {
+                /* ignore */
+            }
+        }
+        return taken ? `ok, collected ${taken} ${job.output}` : "took nothing (still cooking)";
+    }
+
+    // Detect /pause on the Minecraft server from the world clock. While paused
+    // the loop runs no actions and raises no triggers; on resume the
+    // no-progress clock restarts so the pause is not counted against the goal.
+    checkServerPaused() {
+        const age = this.bot.time ? this.bot.time.age : null;
+        const now = Date.now();
+        if (age === null || age === undefined) return false; // unknown: never treat as paused
+        if (age !== this._lastAge) {
+            this._lastAge = age;
+            this._lastAgeChangeAt = now;
+            if (this.serverPaused) {
+                this.serverPaused = false;
+                this.lastProgressAt = now;
+                this.actionsSinceProgress = 0;
+                this.positions = [];
+                console.log("fastLoop: server resumed");
+                this.pushTrigger("server_resumed", {});
+            }
+        } else if (!this.serverPaused && now - this._lastAgeChangeAt > SERVER_PAUSE_DETECT_MS) {
+            this.serverPaused = true;
+            console.log("fastLoop: server paused (world clock stopped); idling until it resumes");
+            this.pushTrigger("server_paused", {});
+        }
+        return this.serverPaused;
     }
 
     // Remember where useful blocks were last seen so the bot can walk back.
@@ -296,64 +507,302 @@ class FastLoop {
         });
     }
 
-    // Jump-and-place tower: look down, jump, place the block under the feet
-    // once the bot has risen clear of its old position, land, repeat.
+    // Jump-and-place tower. Jump is held the whole time (the bot re-jumps on
+    // every landing); on each physics tick while the bot is at least one full
+    // block above where its feet were, one placement is sent under the feet.
+    // A level is done when the block under the feet turns solid; a level gets
+    // several jumps before giving up, and the whole thing stops cleanly on a
+    // ceiling, a missing floor, no blocks, or an abort.
     async pillarUp(height, isAborted) {
         const bot = this.bot;
         const blockName = PILLAR_BLOCKS.find((n) => this.inventoryCounts()[n]);
         if (!blockName) return "failed: no blocks to pillar with";
         const item = bot.inventory.items().find((i) => i.name === blockName);
         await bot.equip(item, "hand");
+        const solid = (pos) => {
+            const b = bot.blockAt(pos);
+            return Boolean(b && b.boundingBox === "block");
+        };
         let placed = 0;
-        for (let i = 0; i < height; i++) {
-            if (!this.active || isAborted()) break;
-            if (!this.inventoryCounts()[blockName]) break;
+        const finish = (why) => {
+            bot.setControlState("jump", false);
+            if (!placed) this.pillarFailedAt = Date.now();
+            return placed ? `ok, pillared ${placed}${why ? ` (${why})` : ""}` : `failed: ${why}`;
+        };
+        // stand in the middle of the block so the tower is under the bot, not beside it
+        const feet0 = bot.entity.position.floored();
+        const off = bot.entity.position.minus(feet0.offset(0.5, 0, 0.5));
+        if (Math.abs(off.x) > 0.25 || Math.abs(off.z) > 0.25) {
+            try {
+                const { goals } = require("mineflayer-pathfinder");
+                await withTimeout(bot.pathfinder.goto(new goals.GoalBlock(feet0.x, feet0.y, feet0.z)), 4000, "pillar centre");
+            } catch (err) {
+                /* try from where we are */
+            }
+        }
+        if (!(await this.waitFor(() => bot.entity.onGround, 1000))) return finish("not on the ground");
+
+        for (let level = 0; level < height; level++) {
+            if (!this.active || isAborted()) return finish("interrupted");
+            if (!this.inventoryCounts()[blockName]) return finish("out of blocks");
             const feet = bot.entity.position.floored();
             const ref = bot.blockAt(feet.offset(0, -1, 0));
-            if (!ref || ref.boundingBox !== "block") {
-                return placed ? `ok, pillared ${placed} (nothing solid below)` : "failed: nothing solid below";
-            }
-            const headroom = bot.blockAt(feet.offset(0, 2, 0));
-            if (headroom && headroom.boundingBox === "block") {
-                return placed ? `ok, pillared ${placed} (ceiling)` : "failed: ceiling overhead";
+            if (!ref || ref.boundingBox !== "block") return finish("nothing solid below");
+            // Underground the way up is blocked: dig the block overhead first
+            // (the jump needs two blocks of air above the feet).
+            for (const dy of [2, 3]) {
+                const head = bot.blockAt(feet.offset(0, dy, 0));
+                if (head && head.boundingBox === "block") {
+                    if (!bot.canDigBlock(head) || /bedrock|obsidian|lava|water/.test(head.name)) {
+                        return finish(`cannot dig ${head.name} overhead`);
+                    }
+                    try {
+                        await withTimeout(bot.dig(head, true), 12000, "pillar dig");
+                    } catch (err) {
+                        return finish(`could not dig ${head.name} overhead`);
+                    }
+                    await bot.equip(bot.inventory.items().find((i) => i.name === blockName), "hand");
+                }
             }
             await bot.lookAt(feet.offset(0.5, -0.5, 0.5), true); // straight down, instantly
+
             bot.setControlState("jump", true);
-            // the block goes where the feet were, so wait until the bot is well above that
-            const rose = await this.waitFor(() => bot.entity.position.y > feet.y + 0.8, 800);
-            if (!rose) {
-                bot.setControlState("jump", false);
-                return placed ? `ok, pillared ${placed} (could not jump)` : "failed: could not jump";
+            let sends = 0;
+            let jumps = 0;
+            let wasAirborne = false;
+            const ok = await this.waitFor(() => {
+                if (isAborted() || !this.active) return true;
+                if (solid(feet)) return true; // the level is built
+                const airborne = !bot.entity.onGround;
+                if (airborne && !wasAirborne) jumps++;
+                if (!airborne && wasAirborne) sends = 0; // landed: a fresh set of sends next jump
+                wasAirborne = airborne;
+                if (jumps > 6) return true; // give up on this level
+                // Inside the window (a full block above the old feet) send the
+                // placement on every tick, several per jump: one of them lands
+                // while the server also sees the bot high enough.
+                if (sends < PILLAR_SENDS_PER_JUMP && bot.entity.position.y > feet.y + PILLAR_WINDOW_Y) {
+                    sends++;
+                    bot._placeBlockWithOptions(ref, new Vec3(0, 1, 0), { forceLook: "ignore", swingArm: "right" })
+                        .catch(() => {}); // rejections are expected; solid() is the confirmation
+                }
+                return false;
+            }, 9000);
+            if (!ok || !solid(feet)) {
+                console.log(`fastLoop: pillar level ${level + 1} failed after ${jumps} jump(s) at y=${feet.y}`);
+                return finish(ok ? "placement rejected" : "timed out");
             }
-            try {
-                await withTimeout(
-                    bot._placeBlockWithOptions(ref, new Vec3(0, 1, 0), { forceLook: "ignore", swingArm: "right" }),
-                    1500,
-                    "pillar place"
-                );
-                placed++;
-            } catch (err) {
-                bot.setControlState("jump", false);
-                return placed ? `ok, pillared ${placed} (${err.message.slice(0, 40)})` : `failed: ${err.message.slice(0, 60)}`;
-            } finally {
-                bot.setControlState("jump", false);
-            }
-            await this.waitFor(() => bot.entity.onGround, 1500);
+            placed++;
+            // let the bot settle on the new block before the next level
+            await this.waitFor(() => bot.entity.onGround && bot.entity.position.y >= feet.y + 1, 1500);
         }
-        return placed ? `ok, pillared ${placed}` : "failed: could not place";
+        return finish("");
     }
 
-    // Items to put away: junk above a small keep count, never tools or the goal target.
+    // An air block next to the bot with a solid neighbour to place against.
+    // Underground the diagonal is usually rock, so search around and, failing
+    // that, dig a pocket at feet level.
+    findPlaceSpot() {
+        const bot = this.bot;
+        const feet = bot.entity.position.floored();
+        const isAir = (p) => {
+            const b = bot.blockAt(p);
+            return Boolean(b && (b.name === "air" || b.name === "cave_air"));
+        };
+        const isSolid = (p) => {
+            const b = bot.blockAt(p);
+            return Boolean(b && b.boundingBox === "block");
+        };
+        const around = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1], [2, 0], [-2, 0], [0, 2], [0, -2]];
+        const faces = [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+        for (const dy of [0, -1, 1]) {
+            for (const [dx, dz] of around) {
+                const p = feet.offset(dx, dy, dz);
+                if (!isAir(p)) continue;
+                if (faces.some(([a, b, c]) => isSolid(p.offset(a, b, c)))) return p;
+            }
+        }
+        return null;
+    }
+
+    async digPocket() {
+        const bot = this.bot;
+        const feet = bot.entity.position.floored();
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const p = feet.offset(dx, 0, dz);
+            const b = bot.blockAt(p);
+            if (!b || b.boundingBox !== "block" || /bedrock|obsidian/.test(b.name) || !bot.canDigBlock(b)) continue;
+            try {
+                if (bot.tool) await bot.tool.equipForBlock(b);
+                await withTimeout(bot.dig(b, true), 12000, "pocket dig");
+                return p;
+            } catch (err) {
+                /* try the next side */
+            }
+        }
+        return null;
+    }
+
+    // Is there open sky above these feet (no solid block overhead)?
+    skyAbove(feet) {
+        for (let dy = 2; dy < 90 && feet.y + dy < 320; dy++) {
+            const b = this.bot.blockAt(feet.offset(0, dy, 0));
+            if (b && b.boundingBox === "block") return false;
+        }
+        return true;
+    }
+
+    solidOverhead(feet) {
+        let n = 0;
+        for (let dy = 2; dy < 90 && feet.y + dy < 320; dy++) {
+            const b = this.bot.blockAt(feet.offset(0, dy, 0));
+            if (b && b.boundingBox === "block") n++;
+        }
+        return n;
+    }
+
+    // Dig a staircase up to the surface: per step clear the jump headroom and
+    // the two blocks of the next tread, then step up. Needs a pickaxe and no
+    // block placement at all, which is why it works where pillaring does not.
+    async surfaceUp(isAborted) {
+        const bot = this.bot;
+        const { goals } = require("mineflayer-pathfinder");
+        const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+        let di = ((Math.round((bot.entity.yaw || 0) / (Math.PI / 2)) % 4) + 4) % 4;
+        let steps = 0;
+        let stalled = 0;
+        for (; steps < 48; steps++) {
+            if (!this.active || isAborted()) return `interrupted after ${steps} steps`;
+            const feet = bot.entity.position.floored();
+            if (this.skyAbove(feet)) return `ok, reached the surface after ${steps} steps`;
+            const [dx, dz] = dirs[di];
+            const toClear = [feet.offset(0, 2, 0), feet.offset(dx, 1, dz), feet.offset(dx, 2, dz), feet.offset(dx, 3, dz)];
+            const danger = toClear.concat([feet.offset(dx, 0, dz)]).some((p) => /lava|water/.test(((bot.blockAt(p) || {}).name) || ""));
+            if (danger) {
+                di = (di + 1) % 4; // turn away from liquids
+                continue;
+            }
+            for (const p of toClear) {
+                const b = bot.blockAt(p);
+                if (!b || b.boundingBox !== "block") continue;
+                if (/bedrock/.test(b.name) || !bot.canDigBlock(b)) return `failed: cannot dig ${b.name} after ${steps} steps`;
+                try {
+                    if (bot.tool) await bot.tool.equipForBlock(b);
+                } catch (err) {
+                    /* dig with whatever is held */
+                }
+                await withTimeout(bot.dig(b, true), 15000, "staircase dig");
+            }
+            const tread = bot.blockAt(feet.offset(dx, 0, dz));
+            if (!tread || tread.boundingBox !== "block") {
+                di = (di + 1) % 4; // nothing to stand on ahead: turn
+                continue;
+            }
+            try {
+                await withTimeout(bot.pathfinder.goto(new goals.GoalBlock(feet.x + dx, feet.y + 1, feet.z + dz)), 6000, "staircase step");
+            } catch (err) {
+                bot.setControlState("forward", true);
+                bot.setControlState("jump", true);
+                await sleep(700);
+                bot.clearControlStates();
+            }
+            if (bot.entity.position.floored().y <= feet.y) {
+                stalled++;
+                if (stalled > 2) {
+                    di = (di + 1) % 4;
+                    stalled = 0;
+                }
+            } else {
+                stalled = 0;
+            }
+        }
+        return `ok, climbed ${steps} steps, surface not yet reached`;
+    }
+
+    // Items to put away: everything the keep table does not want, and the
+    // excess above a cap for bulk items; never the goal targets or food.
     junkToDeposit(inventory) {
         const out = {};
-        for (const name of JUNK) {
-            const count = inventory[name] || 0;
-            if (count <= JUNK_KEEP) continue;
-            if (this.target && this.target.matches(name)) continue;
-            if (this.highTarget && this.highTarget.matches(name)) continue;
-            out[name] = count - JUNK_KEEP;
+        const wanted = (name) =>
+            (this.target && this.target.matches(name)) ||
+            (this.highTargets || []).some((t) => t.matches && t.matches(name)) ||
+            EDIBLE.includes(name);
+        for (const [name, count] of Object.entries(inventory)) {
+            if (wanted(name)) continue;
+            let cap = KEEP_CAP[name];
+            if (cap === undefined) {
+                for (const [fam, c] of Object.entries(KEEP_CAP)) {
+                    if (fam.startsWith("family:") && (FAMILIES[fam.slice(7)] || []).includes(name)) cap = c;
+                }
+            }
+            if (cap !== undefined) {
+                if (count > cap) out[name] = count - cap;
+                continue;
+            }
+            if (KEEP_ALL_RE.test(name)) continue;
+            out[name] = count;
         }
         return out;
+    }
+
+    freeSlots() {
+        const bot = this.bot;
+        const used = typeof bot.inventoryUsed === "function" ? bot.inventoryUsed() : 0;
+        return INVENTORY_SLOTS - used;
+    }
+
+    // Chests whose contents are known (opened before), nearest first.
+    chestsKnown(maxDistance = CHEST_REACH) {
+        const bot = this.bot;
+        const obs = (bot.obsList || []).find((o) => o.name === "nearbyChests");
+        const out = [];
+        if (!obs || !obs.chestsItems) return out;
+        const here = bot.entity.position;
+        for (const [key, items] of Object.entries(obs.chestsItems)) {
+            if (!items || typeof items !== "object") continue;
+            const m = String(key).match(/\(?\s*(-?\d+)[, ]+(-?\d+)[, ]+(-?\d+)/);
+            if (!m) continue;
+            const pos = new Vec3(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10));
+            const d = pos.distanceTo(here);
+            if (d <= maxDistance) out.push({ pos, items, distance: Math.round(d) });
+        }
+        return out.sort((a, b) => a.distance - b.distance);
+    }
+
+    // Equipping strictly better armor is not a judgment call: do it in code.
+    async autoEquipArmor() {
+        const bot = this.bot;
+        for (const piece of Object.keys(this.armorUpgrades(this.inventoryCounts()))) {
+            const item = bot.inventory.items().find((i) => i.name === piece);
+            const slot = FastLoop.ARMOR_SLOTS.find(([, suffix]) => piece.endsWith(`_${suffix}`));
+            if (!item || !slot) continue;
+            try {
+                await withTimeout(bot.equip(item, slot[2]), 5000, "auto equip");
+                console.log(`fastLoop: wearing ${piece}`);
+                this.recent.push({ action: `equip:${piece}`, outcome: "ok (automatic)" });
+                if (this.recent.length > RECENT_ACTIONS) this.recent.shift();
+            } catch (err) {
+                /* try again after the next action */
+            }
+        }
+    }
+
+    landmarkDistance(name) {
+        const l = this.landmarks[name];
+        if (!l || !this.bot.entity) return null;
+        const p = this.bot.entity.position;
+        return Math.round(Math.hypot(l.x - p.x, l.y - p.y, l.z - p.z));
+    }
+
+    setHome(pos) {
+        this.home = pos ? { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) } : null;
+        if (this.home) console.log(`fastLoop: home base at ${this.home.x} ${this.home.y} ${this.home.z}`);
+    }
+
+    homeDistance() {
+        if (!this.home || !this.bot.entity) return null;
+        const p = this.bot.entity.position;
+        return Math.round(Math.hypot(this.home.x - p.x, this.home.y - p.y, this.home.z - p.z));
     }
 
     // Tools worth switching to right now: a sword when hostiles are near, the
@@ -381,70 +830,73 @@ class FastLoop {
         );
         const pickaxe = best("pickaxe");
         if (wantsStone && pickaxe && held !== pickaxe) options[pickaxe] = `Equip the ${pickaxe} for mining stone and ore`;
+        // armor is worn automatically by code (see autoEquipArmor)
         return options;
     }
 
-    // ---- subgoal derivation ---------------------------------------------
-    // Candidate subgoals for a high goal, derived from recipes and the world.
-    // Each carries an explicit target so the chosen text never needs to be
-    // re-parsed. One level per call: the brain re-derives after each subgoal.
-    async deriveSubgoals(text, override) {
-        const target = await this.parseTarget(text, override);
-        const inventory = this.inventoryCounts();
+    // slot -> [armor slot index in the inventory window, name suffix, equip destination]
+    static get ARMOR_SLOTS() {
+        return [[5, "helmet", "head"], [6, "chestplate", "torso"], [7, "leggings", "legs"], [8, "boots", "feet"]];
+    }
+
+    static armorTier(name) {
+        const m = name && name.match(/^(leather|golden|chainmail|iron|diamond|netherite|turtle)_/);
+        return m ? ["leather", "golden", "chainmail", "turtle", "iron", "diamond", "netherite"].indexOf(m[1]) : -1;
+    }
+
+    // { carried piece name -> currently worn piece name | null } for every upgrade available
+    armorUpgrades(inventory) {
+        const out = {};
+        for (const [slot, suffix] of FastLoop.ARMOR_SLOTS) {
+            const wornItem = this.bot.inventory && this.bot.inventory.slots ? this.bot.inventory.slots[slot] : null;
+            const wornTier = wornItem ? FastLoop.armorTier(wornItem.name) : -1;
+            let best = null;
+            for (const name of Object.keys(inventory)) {
+                if (!name.endsWith(`_${suffix}`)) continue;
+                if (wornItem && wornItem.name === name && inventory[name] <= 1) continue; // only the worn one
+                const tier = FastLoop.armorTier(name);
+                if (tier > wornTier && (!best || tier > FastLoop.armorTier(best))) best = name;
+            }
+            if (best) out[best] = wornItem ? wornItem.name : null;
+        }
+        return out;
+    }
+
+    // ---- subgoal derivation (see goalPlanner.js) --------------------------
+    // Decompose the goal into a requirement graph (recipes, smelting, block
+    // drops, mob drops, tool tiers, stations, fuel) with quantities aggregated
+    // per item, and offer the ready leaves as subgoals, deepest first.
+    async deriveSubgoals(text, override, extraTargets, lookahead) {
+        const { planGoal } = require("./goalPlanner");
+        const result = await planGoal(this, text, override, extraTargets, lookahead);
+        // never offer a step that is already done
+        const live = [];
+        for (const c of result.candidates) {
+            if (c.text === text || !(await this.targetSatisfied(c.target))) live.push(c);
+        }
+        result.candidates = live;
+        return result;
+    }
+
+    recipesFor(itemId) {
+        if (!this._recipes) this._recipes = require("prismarine-recipe")(this.bot.version).Recipe;
+        return this._recipes.find(itemId, null);
+    }
+
+    // Is a goal target (override form) already met right now?
+    async targetSatisfied(override) {
+        if (!override || override.none) return false;
+        const t = await this.parseTarget("", override);
+        if (!t) return false;
+        const s = this.summarise(t);
+        return s.have >= s.need; // what is held now, not what was gained since parsing
+    }
+
+    // For the brain: which of these candidate targets are already satisfied.
+    async checkSatisfied(targets) {
         const out = [];
-        const seen = new Set();
-        const add = (c) => {
-            if (seen.has(c.text) || out.length >= MAX_SUBGOAL_CANDIDATES) return;
-            seen.add(c.text);
-            out.push(c);
-        };
-        if (target && target.kind !== "nearBlock") {
-            const summary = this.summarise(target);
-            const remaining = Math.max(1, summary.need - summary.gained);
-            const itemDef = target.key.startsWith("*_") ? null : this.mcData.itemsByName[target.key];
-            const blocks = Object.keys(this.mcData.blocksByName).filter(
-                (b) => target.matches(b) || target.matches(ORE_DROPS[b] || "")
-            );
-            // Items that drop from a block are mined, not crafted (raw_iron has a
-            // recipe from raw_iron_block, which is never the sensible route).
-            if (itemDef && !blocks.length) {
-                const plan = this.bestRecipe(itemDef.id, remaining, inventory);
-                if (plan) {
-                    const table = this.bot.findBlock({ matching: this.mcData.blocksByName.crafting_table.id, maxDistance: 32 });
-                    if (plan.requiresTable && !table) {
-                        if (inventory.crafting_table) {
-                            add({ text: "Place the crafting table", target: { nearBlock: "crafting_table" }, why: "the recipe needs a crafting table and one is in the inventory" });
-                        } else {
-                            add({ text: "Obtain 1 crafting_table", target: { item: "crafting_table", count: 1 }, why: "the recipe needs a crafting table" });
-                        }
-                    }
-                    for (const [name, missing] of Object.entries(plan.missing)) {
-                        add({ text: `Obtain ${missing} ${name}`, target: { item: name, count: missing }, why: `ingredient for ${target.key}` });
-                    }
-                    if (!Object.keys(plan.missing).length) {
-                        add({ text: `Craft ${remaining} ${target.key}`, target: { item: target.key, count: remaining }, why: "all ingredients are in the inventory" });
-                    }
-                }
-            }
-            if (blocks.length) {
-                const nearby = this.blockNearby((b) => blocks.includes(b));
-                const tier = this.requiredPickaxe(blocks);
-                if (tier && PICKAXE_TIER.indexOf(tier) > PICKAXE_TIER.indexOf(this.toolTier())) {
-                    add({ text: `Obtain 1 ${tier}_pickaxe`, target: { item: `${tier}_pickaxe`, count: 1 }, why: `${blocks[0]} needs at least a ${tier} pickaxe` });
-                }
-                const family = target.key.startsWith("*_") ? target.key : blocks.length === 1 ? blocks[0] : `*_${commonSuffix(blocks)}`;
-                if (nearby) {
-                    add({ text: `Mine ${remaining} ${target.key}`, target: { item: target.key, count: remaining }, why: "a matching block is within reach" });
-                } else {
-                    add({ text: `Explore to find ${family}`, target: { nearBlock: family }, why: "no matching block is within scan range" });
-                }
-            }
-        }
-        if (this.bot.food < 10 && !EDIBLE.some((f) => inventory[f])) {
-            add({ text: "Obtain 1 cooked_beef", target: { item: "*_beef", count: 1 }, why: "hunger is low and there is no food" });
-        }
-        add({ text, target: override || (target ? { item: target.key, count: target.need } : { none: true }), why: "work on the high goal directly" });
-        return { target: this.summarise(target), candidates: out };
+        for (const t of targets || []) out.push(await this.targetSatisfied(t));
+        return out;
     }
 
     // Recipe for `itemId` that leaves the fewest ingredients missing, scaled to `need`.
@@ -480,15 +932,36 @@ class FastLoop {
             for (const id of Object.keys(tools)) {
                 const item = this.mcData.items[id];
                 const m = item && item.name.match(/^(\w+)_pickaxe$/);
-                if (m && (lowest === null || PICKAXE_TIER.indexOf(m[1]) < lowest)) lowest = PICKAXE_TIER.indexOf(m[1]);
+                if (!m) continue;
+                // golden pickaxes harvest like wooden ones and are not a tier the bot tracks
+                const idx = PICKAXE_TIER.indexOf(m[1] === "golden" ? "wooden" : m[1]);
+                if (idx >= 0 && (lowest === null || idx < lowest)) lowest = idx;
             }
             if (lowest !== null && (tier === null || lowest < tier)) tier = lowest;
         }
         return tier === null ? null : PICKAXE_TIER[tier];
     }
 
+    // The pathfinder may dig but never places blocks: its tower and bridge
+    // moves send one placement at lift-off and bounce for many jumps before
+    // one lands. Vertical movement is the pillar action and the staircase.
+    configurePathfinder() {
+        try {
+            const { Movements } = require("mineflayer-pathfinder");
+            const m = new Movements(this.bot, this.mcData);
+            m.allow1by1towers = false;
+            m.scafoldingBlocks = [];
+            m.canDig = true;
+            this.bot.pathfinder.setMovements(m);
+            this.movements = m;
+        } catch (err) {
+            console.log("fastLoop: could not configure pathfinder movements:", err.message);
+        }
+    }
+
     // ---- lifecycle -------------------------------------------------------
     async setGoal(goal) {
+        if (this.movements && this.bot.pathfinder) this.bot.pathfinder.setMovements(this.movements); // /step resets them
         if (!goal || typeof goal.text !== "string" || !goal.text.trim()) {
             throw new Error("goal.text must be a non-empty string");
         }
@@ -509,13 +982,25 @@ class FastLoop {
             const hid = goal.highGoal.id || goal.highGoal.text;
             if (!this.highGoal || this.highGoal.id !== hid) {
                 this.highGoal = { id: hid, text: goal.highGoal.text };
-                this.highTarget = await this.parseTarget(goal.highGoal.text, goal.highGoal.target);
+                // a milestone is several targets at once; all must hold to finish
+                const specs = Array.isArray(goal.highGoal.targets) && goal.highGoal.targets.length
+                    ? goal.highGoal.targets
+                    : [goal.highGoal.target];
+                this.highTargets = [];
+                for (const spec of specs) {
+                    const t = await this.parseTarget(goal.highGoal.text, spec || undefined);
+                    if (t) this.highTargets.push(t);
+                }
+                this.highTarget = this.highTargets[0] || null;
                 this.highGoalReached = false;
-                console.log(`fastLoop: high goal "${this.highGoal.text}" target=${JSON.stringify(this.summarise(this.highTarget))}`);
+                console.log(
+                    `fastLoop: high goal "${this.highGoal.text}" targets=${JSON.stringify(this.highTargets.map((t) => this.summarise(t)))}`
+                );
             }
         } else if (this.goal.kind !== "standing") {
             this.highGoal = null;
             this.highTarget = null;
+            this.highTargets = [];
             this.highGoalReached = false;
         }
         this.actionsSinceProgress = 0;
@@ -527,6 +1012,13 @@ class FastLoop {
             if (Array.isArray(seq)) this.replay = [...seq];
         }
         this.replaySource = this.replay.length ? this.target && this.target.key : null;
+        // A goal that is already met the moment it is posted is not a skill;
+        // tell the brain so it re-selects without recording one.
+        const initial = this.summarise(this.target);
+        if (initial && initial.gained >= initial.need && this.goal.kind === "task") {
+            this.goalReached = true;
+            this.pushTrigger("goal_reached", { target: initial, instant: true, trace: [] });
+        }
         this.prims.resetCounters();
         this.trace = [];
         this.recent = [];
@@ -560,7 +1052,68 @@ class FastLoop {
             }
         }
         this.goal = null; // loop idles until the new goal is installed
-        await sleep(50);
+        await this.cancelCurrentTask();
+    }
+
+    // A primitive that timed out (collectBlock, a craft walking to its table,
+    // a goto) is still driving the pathfinder. Starting the next primitive on
+    // top of it is what produces "Path was stopped before it could be
+    // completed": stop everything first, in the order botCleanup uses.
+    async cancelCurrentTask() {
+        const bot = this.bot;
+        let cancelled = true;
+        try {
+            if (bot.collectBlock) await withTimeout(Promise.resolve(bot.collectBlock.cancelTask()), 3000, "cancelTask");
+        } catch (err) {
+            cancelled = false;
+        }
+        if (!cancelled && bot.collectBlock) {
+            // The collect task did not answer pathfinder.stop() (a dig waiting on the
+            // server, an equip that never returned). Left alone, every later collect()
+            // queues behind it and each mine action times out in turn. Reset it by hand.
+            console.log("fastLoop: collect task did not cancel in time; resetting collectBlock state");
+            try {
+                bot.stopDigging();
+            } catch (err) {
+                /* ignore */
+            }
+            try {
+                if (bot.collectBlock.targets) bot.collectBlock.targets.clear();
+            } catch (err) {
+                /* ignore */
+            }
+            try {
+                bot.emit("collectBlock_finished"); // releases every cancelTask() waiter
+            } catch (err) {
+                /* ignore */
+            }
+        }
+        try {
+            if (bot.pvp && bot.pvp.stop) await withTimeout(Promise.resolve(bot.pvp.stop()), 2000, "pvp.stop");
+        } catch (err) {
+            /* ignore */
+        }
+        try {
+            bot.pathfinder.stop();
+        } catch (err) {
+            /* ignore */
+        }
+        try {
+            bot.pathfinder.setGoal(null);
+        } catch (err) {
+            /* ignore */
+        }
+        try {
+            bot.clearControlStates();
+        } catch (err) {
+            /* ignore */
+        }
+        try {
+            bot.stopDigging();
+        } catch (err) {
+            /* not digging */
+        }
+        await sleep(150); // let the stopped tasks settle before the next primitive
     }
 
     async stop() {
@@ -589,6 +1142,30 @@ class FastLoop {
             // reached when a matching block is within scan range (exploration subgoals)
             const key = String(override.nearBlock);
             return { kind: "nearBlock", key: `near:${key}`, block: key, need: 1, matches: matcherFor(key), startHave: 0 };
+        }
+        if (override && override.freeSlots) {
+            // reached when at least this many inventory slots are empty
+            const n = Math.max(1, parseInt(override.freeSlots, 10) || 1);
+            return { kind: "freeSlots", key: `free:${n}`, need: n, matches: () => false, startHave: 0 };
+        }
+        if (override && override.nearPlayer) {
+            // reached when the bot stands within `distance` blocks of that player
+            const name = String(override.nearPlayer);
+            const distance = Math.max(1, parseInt(override.distance, 10) || 3);
+            return { kind: "nearPlayer", key: `player:${name}`, player: name, distance, need: 1, matches: () => false, startHave: 0 };
+        }
+        if (override && override.give) {
+            // reached when `count` of the item have been dropped at a player's feet (counted in code)
+            const g = override.give;
+            const item = String(g.item || "");
+            const to = String(g.to || "");
+            const need = Math.max(1, parseInt(g.count, 10) || 1);
+            return { kind: "give", key: `give:${item}:${to}`, item, player: to, need, given: 0, matches: matcherFor(item), startHave: 0 };
+        }
+        if (override && override.dimension) {
+            // reached when the bot is in that dimension (overworld, the_nether, the_end)
+            const dim = String(override.dimension);
+            return { kind: "dimension", key: `dimension:${dim}`, dimension: dim, need: 1, matches: () => false, startHave: 0 };
         }
         if (override && override.item) {
             const key = String(override.item);
@@ -673,6 +1250,24 @@ class FastLoop {
             const have = this.blockNearby(target.matches) ? 1 : 0;
             return { item: target.key, need: 1, have, gained: have };
         }
+        if (target.kind === "freeSlots") {
+            const have = this.freeSlots();
+            return { item: target.key, need: target.need, have, gained: have };
+        }
+        if (target.kind === "nearPlayer") {
+            const d = this.playerDistance(target.player);
+            const have = d !== null && d <= target.distance ? 1 : 0;
+            return { item: target.key, need: 1, have, gained: have, playerDistance: d };
+        }
+        if (target.kind === "give") {
+            const held = countMatching(this.inventoryCounts(), target.matches);
+            return { item: target.key, need: target.need, have: target.given, gained: target.given, holding: held, playerDistance: this.playerDistance(target.player) };
+        }
+        if (target.kind === "dimension") {
+            const current = (this.bot.game && this.bot.game.dimension) || "overworld";
+            const have = String(current).replace(/^minecraft:/, "") === target.dimension ? 1 : 0;
+            return { item: target.key, need: 1, have, gained: have };
+        }
         const have = countMatching(this.inventoryCounts(), target.matches);
         return {
             item: target.key,
@@ -680,6 +1275,18 @@ class FastLoop {
             have,
             gained: have - target.startHave,
         };
+    }
+
+    // Players are only visible inside render distance: entity may be missing.
+    playerEntity(name) {
+        const p = (this.bot.players || {})[name];
+        return p && p.entity && p.entity.position ? p.entity : null;
+    }
+
+    playerDistance(name) {
+        const e = this.playerEntity(name);
+        if (!e || !this.bot.entity) return null;
+        return Math.round(e.position.distanceTo(this.bot.entity.position));
     }
 
     blockNearby(matches) {
@@ -711,13 +1318,19 @@ class FastLoop {
 
     fingerprint() {
         const bot = this.bot;
-        const voxels = Array.from(getSurroundingBlocks(bot, 8, 2, 8));
-        const surface = voxels.some((b) => /dirt|log|grass|sand|snow/.test(b));
+        // Underground means rock overhead, not "no dirt nearby": caves have
+        // dirt and gravel, and the biome name alone says nothing about depth.
+        const feet = bot.entity.position.floored();
+        const underground = !this.skyAbove(feet);
         const block = bot.blockAt(bot.entity.position);
-        const biome = block && block.biome ? block.biome.name : "unknown";
+        let biome = "unknown";
+        if (block && block.biome) {
+            const byId = this.mcData.biomes && this.mcData.biomes[block.biome.id];
+            biome = block.biome.name || (byId && byId.name) || "unknown";
+        }
         const t = bot.time ? bot.time.timeOfDay : 0;
         return {
-            biome: surface ? biome : "underground",
+            biome: underground ? "underground" : biome,
             toolTier: this.toolTier(),
             daylight: t >= 13000 && t < 23000 ? "night" : "day",
         };
@@ -822,13 +1435,20 @@ class FastLoop {
             if (sig !== this._lastInventorySig) this.lastProgressAt = now;
             this._lastInventorySig = sig;
         }
-        // 1b. the high goal (parsed once; survives subgoal changes)
-        if (this.highTarget && !this.highGoalReached) {
-            const high = this.summarise(this.highTarget);
-            if (high.gained >= high.need) {
+        // 1b. the high goal (parsed once; survives subgoal changes). A high goal
+        // counts by what the bag holds, like the original critic: "Mine 5 iron
+        // ore" is done when 5 raw iron are held, not when 5 more are mined.
+        if (this.highTargets && this.highTargets.length && !this.highGoalReached) {
+            const highs = this.highTargets.map((t) => this.summarise(t));
+            if (highs.every((h) => h.have >= h.need)) {
                 this.highGoalReached = true;
-                this.pushTrigger("high_goal_reached", { target: high, highGoalId: this.highGoal.id });
+                this.pushTrigger("high_goal_reached", { target: highs[0], targets: highs, highGoalId: this.highGoal.id });
             }
+        }
+        // 1c. a furnace cooking the target is progress in the making
+        if (this.target && this.target.matches && this.furnaceJobs.some((j) => this.target.matches(j.output) && j.readyAt > now)) {
+            this.lastProgressAt = now;
+            this.actionsSinceProgress = 0;
         }
         // 2. no progress for too long: by wall clock or by action count
         const idle = (now - this.lastProgressAt) / 1000;
@@ -900,7 +1520,16 @@ class FastLoop {
                 ? 1
                 : 2;
         resources.sort((a, b) => relevance(a) - relevance(b) || a[1].nearest - b[1].nearest);
-        for (const [name, info] of resources.slice(0, MAX_MENU_MINE)) {
+        // never offer to mine the bot's own crafting table, furnace or chest
+        // ...nor blocks the current pickaxe cannot harvest (the collect plugin
+        // would refuse at the block: "I need at least a stone_pickaxe")
+        const tier = PICKAXE_TIER.indexOf(this.toolTier());
+        const mineable = resources.filter(([name]) => {
+            if (LANDMARK_BLOCKS.includes(name)) return false;
+            const needed = this.requiredPickaxe([name]);
+            return !needed || PICKAXE_TIER.indexOf(needed) <= tier;
+        });
+        for (const [name, info] of mineable.slice(0, MAX_MENU_MINE)) {
             const drop = ORE_DROPS[name] ? ` (drops ${ORE_DROPS[name]})` : "";
             menu[`mine:${name}`] =
                 `Mine the nearest ${name}${drop}: ${info.count} within ${RESOURCE_SCAN_DISTANCE} blocks, ` +
@@ -924,6 +1553,8 @@ class FastLoop {
             } catch (err) {
                 continue;
             }
+            // a station already carried or standing nearby is not worth crafting again
+            if (LANDMARK_BLOCKS.includes(item) && (snap.inventory[item] || this.landmarkDistance(item) !== null && this.landmarkDistance(item) <= 32)) continue;
             if (recipes.length) craftable.push(item);
             if (craftable.length >= MAX_MENU_CRAFT) break;
         }
@@ -945,9 +1576,21 @@ class FastLoop {
             const fuel = FUELS.find((f) => snap.inventory[f]);
             for (const [raw, out] of Object.entries(SMELTABLE)) {
                 if (snap.inventory[raw] && fuel) {
-                    menu[`smelt:${raw}`] = `Smelt one ${raw} into ${out} at the nearby furnace using ${fuel}`;
+                    const n = Math.min(snap.inventory[raw], FURNACE_MAX_BATCH);
+                    menu[`smelt:${raw}`] =
+                        `Load the furnace with ${n} ${raw} (-> ${out}) and ${fuel}, then leave it cooking ` +
+                        `(about ${n * SMELT_SECONDS_PER_ITEM}s; come back with furnace:collect)`;
                 }
             }
+        }
+        for (const job of this.furnaceJobs) {
+            const d = Math.round(job.pos.distanceTo(pos));
+            if (d > CHEST_REACH) continue;
+            const left = Math.max(0, Math.round((job.readyAt - Date.now()) / 1000));
+            menu["furnace:collect"] =
+                `Collect ${job.count} ${job.output} from the furnace ${d} blocks away ` +
+                (left ? `(ready in about ${left}s; waits if early)` : "(ready now)");
+            break;
         }
 
         // mobs
@@ -972,7 +1615,8 @@ class FastLoop {
                 `nearest ${snap.droppedItems.nearest} blocks away`;
         }
         const pillarBlock = PILLAR_BLOCKS.find((n) => snap.inventory[n]);
-        if (pillarBlock && (!above || above.name === "air" || above.name === "cave_air")) {
+        const pillarCooling = this.pillarFailedAt && Date.now() - this.pillarFailedAt < PILLAR_RETRY_MS;
+        if (ENABLE_PILLAR && pillarBlock && !pillarCooling && (!above || above.name === "air" || above.name === "cave_air")) {
             menu["pillar:up"] =
                 `Jump-and-place a ${PILLAR_HEIGHT}-block tower of ${pillarBlock} straight up ` +
                 `(${snap.inventory[pillarBlock]} available; escapes pits and water, reaches the surface)`;
@@ -980,23 +1624,74 @@ class FastLoop {
         for (const [tool, description] of Object.entries(this.equipOptions(snap))) {
             menu[`equip:${tool}`] = description;
         }
-        if (snap.inventoryUsed !== null && snap.inventoryUsed >= INVENTORY_FULL) {
-            const junk = this.junkToDeposit(snap.inventory);
-            const chestNear = bot.findBlock({ matching: this.mcData.blocksByName.chest.id, maxDistance: 32 });
-            if (Object.keys(junk).length && chestNear) {
+        const junk = this.junkToDeposit(snap.inventory);
+        const junkStacks = Object.keys(junk).length;
+        const chestNear = bot.findBlock({ matching: this.mcData.blocksByName.chest.id, maxDistance: 32 });
+        const used = snap.inventoryUsed === null ? 0 : snap.inventoryUsed;
+        const wantsSpace = this.target && this.target.kind === "freeSlots";
+        if (junkStacks && (used >= INVENTORY_DEPOSIT_AT || wantsSpace)) {
+            const summary = Object.entries(junk).slice(0, 6).map(([n, c]) => `${c} ${n}`).join(", ") + (junkStacks > 6 ? ", ..." : "");
+            if (chestNear) {
                 menu["chest:deposit"] =
-                    `Put ${Object.entries(junk).map(([n, c]) => `${c} ${n}`).join(", ")} into the chest ` +
-                    `${Math.round(chestNear.position.distanceTo(pos))} blocks away (inventory ${snap.inventoryUsed}/36 slots used)`;
-            } else if (Object.keys(junk).length && snap.inventory.chest) {
-                menu["place:chest"] = `Place the chest from inventory (inventory ${snap.inventoryUsed}/36 slots used, nothing to store in nearby)`;
+                    `Put ${summary} into the chest ${Math.round(chestNear.position.distanceTo(pos))} blocks away ` +
+                    `(${used}/36 slots used; keeps tools, ore, ingots, food, torches and a stack of building blocks)`;
+            } else if (snap.inventory.chest) {
+                menu["place:chest"] = `Place the chest from inventory to store junk in (${used}/36 slots used, no chest nearby)`;
             }
+            if (!chestNear && (used >= INVENTORY_DISCARD_AT || wantsSpace)) {
+                menu["discard:junk"] = `Throw away ${summary} (${used}/36 slots used, no chest within reach; frees the bag to keep mining)`;
+            }
+        }
+        // take instead of mine: a known chest holds what the goal needs
+        if (this.target && this.target.kind !== "nearBlock" && this.target.kind !== "freeSlots") {
+            for (const chest of this.chestsKnown()) {
+                const held = Object.entries(chest.items).filter(([n]) => this.target.matches(n));
+                if (!held.length) continue;
+                const total = held.reduce((s, [, c]) => s + c, 0);
+                menu[`withdraw:${held[0][0]}`] =
+                    `Take ${held.map(([n, c]) => `${c} ${n}`).join(", ")} from the chest ${chest.distance} blocks away ` +
+                    `(${total} available there, no mining needed)`;
+                break;
+            }
+        }
+        if (this.target && (this.target.kind === "nearPlayer" || this.target.kind === "give")) {
+            const name = this.target.player;
+            const ent = this.playerEntity(name);
+            if (ent) {
+                const d = Math.round(ent.position.distanceTo(pos));
+                const dir = traversal.compassNameOf(ent.position.x - pos.x, ent.position.z - pos.z);
+                if (this.target.kind === "give" && d <= 4) {
+                    const left = this.target.need - this.target.given;
+                    const held = countMatching(this.inventoryCounts(), this.target.matches);
+                    menu[`give:${this.target.item}`] =
+                        `Drop ${Math.min(left, held)} ${this.target.item} at the feet of player ${name} (${d} blocks away; ` +
+                        `${held} in the bag, ${left} still to hand over)`;
+                }
+                if (d > 2) {
+                    menu["goto:player"] = `Walk to player ${name}, ${d} blocks ${dir} at x=${Math.floor(ent.position.x)} y=${Math.floor(ent.position.y)} z=${Math.floor(ent.position.z)}`;
+                }
+            }
+        }
+        const homeDist = this.homeDistance();
+        if (homeDist !== null && homeDist > 16) {
+            menu["return:home"] =
+                `Walk back to the home base ${homeDist} blocks away (crafting table, furnace and chest; ` +
+                `deposit junk, restock, craft)`;
         }
         for (const [name, l] of Object.entries(snap.landmarks)) {
             if (l.distance > WALK_DISTANCE) {
                 menu[`return:${name}`] = `Walk back to the last ${name} seen, ${l.distance} blocks away at x=${l.x} y=${l.y} z=${l.z}`;
             }
         }
-        menu["wait"] = "Do nothing for two seconds (only if nothing above is useful)";
+        if (this.fingerprint().biome === "underground" && this.toolTier() !== "none") {
+            const overhead = this.solidOverhead(pos.floored());
+            menu["surface:up"] =
+                `Dig a staircase up to the surface (about ${overhead} solid blocks overhead; needs no block placing). ` +
+                "Use this to get wood, food or daylight when underground";
+        }
+        // Waiting twice in a row achieves nothing: take it off the menu so the
+        // next pick has to be a move (the loop was seen idling in wait/nudge).
+        // no "wait": standing still never reaches a goal, and the menu always has moves
         return menu;
     }
 
@@ -1095,6 +1790,32 @@ class FastLoop {
                     goalReached: answers.goalReached ? answers.goalReached.noul : null,
                     ms,
                 };
+                // One line per Jev call, kept for the brain to print on its console
+                // (Node's stdout only reaches the log file) and echoed here.
+                const sinceLast = this._lastDecisionAt ? (started - this._lastDecisionAt) / 1000 : null;
+                this._lastDecisionAt = started;
+                const entry = {
+                    n: this.stats.decisions,
+                    at: started,
+                    sinceLast,
+                    ms,
+                    action: a.choice,
+                    confidence: a.confidence,
+                    danger: answers.danger.noul,
+                    stuck: answers.stuck.noul,
+                    valid: answers.subgoalValid.noul,
+                    goalReached: this.lastDecision.goalReached,
+                    options: Object.keys(menu).length,
+                    goal: this.goal ? this.goal.text : null,
+                    inMenu: Boolean(menu[a.choice]),
+                };
+                this.decisionLog.push(entry);
+                if (this.decisionLog.length > 200) this.decisionLog.shift();
+                console.log(
+                    `fastLoop: jev #${entry.n} ${sinceLast === null ? "" : `+${sinceLast.toFixed(1)}s `}${ms}ms -> ${a.choice} ` +
+                        `(${a.confidence.toFixed(2)}) danger ${entry.danger.toFixed(2)} stuck ${entry.stuck.toFixed(2)} ` +
+                        `valid ${entry.valid.toFixed(2)} | ${entry.options} options | ${entry.goal}`
+                );
                 if (answers.danger.noul >= 0.7) {
                     this.pushTrigger("hazard", { jevDanger: answers.danger.noul });
                 }
@@ -1129,6 +1850,7 @@ class FastLoop {
     // Plain-code fallback used when Jev is unavailable or errored.
     heuristic(snap, menu) {
         if (menu.eat && snap.food < 10) return "eat";
+        if (menu["surface:up"] && this.target && /log|planks|stick|wood/.test(this.target.key)) return "surface:up";
         if (menu.flee && snap.health < 10) return "flee";
         const mine = Object.keys(menu).find(
             (k) => k.startsWith("mine:") && this.target && this.target.matches(k.slice(5))
@@ -1139,7 +1861,9 @@ class FastLoop {
             return `walk:${this.goal.hint.direction}`;
         }
         const walks = Object.keys(menu).filter((k) => k.startsWith("walk:") && !/hazards/.test(menu[k]));
-        return walks.length ? walks[Math.floor(Math.random() * walks.length)] : "wait";
+        if (walks.length) return walks[Math.floor(Math.random() * walks.length)];
+        const any = Object.keys(menu);
+        return any.length ? any[0] : "walk:north";
     }
 
     nextReplay(menu) {
@@ -1233,14 +1957,42 @@ class FastLoop {
                         : "recipe did not complete";
                 }
                 case "smelt": {
-                    const fuel = FUELS.find((f) => this.inventoryCounts()[f]);
-                    await withTimeout(this.prims.smeltItem(bot, arg, fuel, 1), CRAFT_TIMEOUT_MS * 2, action);
-                    return "ok";
+                    const summary = this.targetSummary();
+                    const want = summary && this.target && this.target.matches(SMELTABLE[arg] || "") ? Math.max(1, summary.need - summary.have) : FURNACE_MAX_BATCH;
+                    return await withTimeout(this.smeltBatch(arg, want), CRAFT_TIMEOUT_MS * 2, action);
+                }
+                case "furnace": {
+                    let aborted = false;
+                    this.abortCurrent = () => {
+                        aborted = true;
+                        bot.pathfinder.setGoal(null);
+                    };
+                    return await withTimeout(this.collectFurnace(() => aborted), 90000, action);
                 }
                 case "place": {
-                    const spot = pos.offset(1, 0, 1).floored();
+                    // a furnace or chest goes next to the crafting table when one is known nearby
+                    if ((arg === "furnace" || arg === "chest") && this.landmarks.crafting_table) {
+                        const d = this.landmarkDistance("crafting_table");
+                        if (d !== null && d > 3 && d <= 48) {
+                            const t = this.landmarks.crafting_table;
+                            const r = await gotoBounded(new goals.GoalNear(t.x, t.y, t.z, 2), WALK_TIMEOUT_MS * 3);
+                            if (r !== "ok") return `failed: could not reach the crafting table (${r})`;
+                        }
+                    }
+                    let spot = this.findPlaceSpot();
+                    if (!spot) spot = await this.digPocket();
+                    if (!spot) return "failed: no space to place a block";
                     await withTimeout(this.prims.placeItem(bot, arg, spot), CRAFT_TIMEOUT_MS, action);
-                    return "ok";
+                    return this.blockNearby((b) => b === arg) ? "ok" : "failed: block was not placed";
+                }
+                case "surface": {
+                    let aborted = false;
+                    this.abortCurrent = () => {
+                        aborted = true;
+                        bot.pathfinder.setGoal(null);
+                        bot.clearControlStates();
+                    };
+                    return await withTimeout(this.surfaceUp(() => aborted), 120000, action);
                 }
                 case "attack":
                     await withTimeout(
@@ -1278,7 +2030,8 @@ class FastLoop {
                 case "equip": {
                     const item = bot.inventory.items().find((i) => i.name === arg);
                     if (!item) return `failed: no ${arg} in inventory`;
-                    await withTimeout(bot.equip(item, "hand"), 5000, action);
+                    const armor = FastLoop.ARMOR_SLOTS.find(([, suffix]) => arg.endsWith(`_${suffix}`));
+                    await withTimeout(bot.equip(item, armor ? armor[2] : "hand"), 5000, action);
                     return "ok";
                 }
                 case "chest": {
@@ -1291,9 +2044,87 @@ class FastLoop {
                     return bot.inventoryUsed() < slots ? "ok" : "deposited nothing";
                 }
                 case "return": {
-                    const l = this.landmarks[arg];
+                    const l = arg === "home" ? this.home : this.landmarks[arg];
                     if (!l) return `failed: no ${arg} remembered`;
-                    return await gotoBounded(new goals.GoalNear(l.x, l.y, l.z, 2), WALK_TIMEOUT_MS * 3);
+                    const dist = Math.hypot(l.x - pos.x, l.y - pos.y, l.z - pos.z);
+                    if (dist > 80) {
+                        // a long way: one leg of 60 blocks toward it, the loop will pick again
+                        const f = 60 / dist;
+                        const r = await gotoBounded(
+                            new goals.GoalNearXZ(Math.floor(pos.x + (l.x - pos.x) * f), Math.floor(pos.z + (l.z - pos.z) * f), 3),
+                            WALK_TIMEOUT_MS * 4
+                        );
+                        return r === "ok" ? `ok, ${Math.round(dist - 60)} blocks still to go` : r;
+                    }
+                    return await gotoBounded(new goals.GoalNear(l.x, l.y, l.z, 2), WALK_TIMEOUT_MS * 4);
+                }
+                case "goto": {
+                    const name = this.target && this.target.player;
+                    const ent = name ? this.playerEntity(name) : null;
+                    if (!ent) return `failed: player ${name || "?"} not in view`;
+                    const p = ent.position;
+                    const dist = Math.hypot(p.x - pos.x, p.y - pos.y, p.z - pos.z);
+                    if (dist > 80) {
+                        const f = 60 / dist;
+                        const r = await gotoBounded(
+                            new goals.GoalNearXZ(Math.floor(pos.x + (p.x - pos.x) * f), Math.floor(pos.z + (p.z - pos.z) * f), 3),
+                            WALK_TIMEOUT_MS * 4
+                        );
+                        return r === "ok" ? `ok, ${Math.round(dist - 60)} blocks still to go` : r;
+                    }
+                    return await gotoBounded(new goals.GoalNear(p.x, p.y, p.z, 2), WALK_TIMEOUT_MS * 4);
+                }
+                case "give": {
+                    const t = this.target;
+                    if (!t || t.kind !== "give") return "failed: no give target";
+                    const ent = this.playerEntity(t.player);
+                    if (!ent) return `failed: player ${t.player} not in view`;
+                    if (ent.position.distanceTo(pos) > 6) return "failed: too far from the player, walk closer first";
+                    const def = this.mcData.itemsByName[t.item];
+                    if (!def) return `failed: unknown item ${t.item}`;
+                    const before = countMatching(this.inventoryCounts(), t.matches);
+                    const count = Math.min(t.need - t.given, before);
+                    if (count <= 0) return before ? "ok" : `failed: no ${t.item} in the bag`;
+                    try {
+                        await bot.lookAt(ent.position.offset(0, 1, 0), true);
+                        await withTimeout(bot.toss(def.id, null, count), 4000, "toss");
+                    } catch (err) {
+                        return `failed: ${err.message.split("\n")[0].slice(0, 60)}`;
+                    }
+                    const dropped = before - countMatching(this.inventoryCounts(), t.matches);
+                    t.given += Math.max(0, dropped);
+                    return dropped > 0 ? `ok, handed ${dropped} ${t.item} to ${t.player}` : "failed: nothing dropped";
+                }
+                case "discard": {
+                    const junk = this.junkToDeposit(this.inventoryCounts());
+                    let tossed = 0;
+                    for (const [name, count] of Object.entries(junk)) {
+                        const def = this.mcData.itemsByName[name];
+                        if (!def) continue;
+                        try {
+                            await withTimeout(bot.toss(def.id, null, count), 4000, "toss");
+                            tossed++;
+                            await sleep(150);
+                        } catch (err) {
+                            /* next item */
+                        }
+                    }
+                    return tossed ? `ok, tossed ${tossed} kind(s) of junk, ${this.freeSlots()} slots free` : "failed: nothing tossed";
+                }
+                case "withdraw": {
+                    const chest = this.chestsKnown().find((c) => Object.keys(c.items).some((n) => this.target && this.target.matches(n)));
+                    if (!chest) return "failed: no known chest holds that";
+                    const want = {};
+                    const summary = this.targetSummary();
+                    let remaining = summary ? Math.max(1, summary.need - summary.have) : 8;
+                    for (const [n, c] of Object.entries(chest.items)) {
+                        if (!this.target.matches(n) || remaining <= 0) continue;
+                        want[n] = Math.min(c, remaining);
+                        remaining -= want[n];
+                    }
+                    const before = this.freeSlots();
+                    await withTimeout(this.prims.getItemFromChest(bot, chest.pos, want), CRAFT_TIMEOUT_MS * 2, action);
+                    return this.freeSlots() <= before ? "ok" : "took nothing";
                 }
                 case "wait":
                 default:
@@ -1302,7 +2133,11 @@ class FastLoop {
             }
         } catch (err) {
             const msg = err && err.message ? err.message.split("\n")[0].slice(0, 100) : String(err);
-            return /timed out/.test(msg) ? "timeout" : `failed: ${msg}`;
+            if (/timed out/.test(msg)) {
+                await this.cancelCurrentTask(); // the primitive is still running: stop it
+                return "timeout";
+            }
+            return `failed: ${msg}`;
         } finally {
             this.abortCurrent = null;
             try {
@@ -1316,7 +2151,7 @@ class FastLoop {
     // ---- main loop -------------------------------------------------------
     async run() {
         while (this.active) {
-            if (!this.goal) {
+            if (this.checkServerPaused() || !this.goal) {
                 await sleep(100);
                 continue;
             }
@@ -1349,6 +2184,8 @@ class FastLoop {
             const outcome = await this.execute(action);
             // a new goal may have landed mid-action: its trace must not inherit this outcome
             if (!this.goal || this.goal.id !== goalId) continue;
+            // the server may have been paused mid-action: that outcome is noise
+            if (this.checkServerPaused()) continue;
             if (replayed && !/^ok/.test(outcome)) {
                 console.log(`fastLoop: replay step "${action}" ${outcome}, handing control to Jev`);
                 this.replay = [];
@@ -1358,6 +2195,7 @@ class FastLoop {
             const gain = before && after ? after.gained - before.gained : 0;
             this.stats.actions++;
             this.actionsSinceProgress = gain > 0 ? 0 : this.actionsSinceProgress + 1;
+            await this.autoEquipArmor();
             this.recent.push({
                 action,
                 outcome: gain > 0 ? `${outcome}, +${gain} ${after.item}` : outcome,
@@ -1382,6 +2220,8 @@ class FastLoop {
     // ---- status ----------------------------------------------------------
     status({ drain = true } = {}) {
         const triggers = drain ? this.pending.splice(0) : [...this.pending];
+        const decisions = drain ? this.decisionLog.splice(0) : [...this.decisionLog];
+        const chat = drain ? this.playerChat.splice(0) : [...this.playerChat];
         let fingerprint = null;
         try {
             fingerprint = this.bot.entity ? this.fingerprint() : null;
@@ -1390,13 +2230,23 @@ class FastLoop {
         }
         return {
             running: this.active,
+            botName: this.bot.username || null,
+            players: Object.keys(this.bot.players || {}).filter((n) => !this.isBotName(n)),
+            chat,
+            serverPaused: this.serverPaused,
             goal: this.goal,
             target: this.targetSummary(),
             goalReached: this.goalReached,
             highGoal: this.highGoal || null,
             highTarget: this.summarise(this.highTarget),
+            highTargets: (this.highTargets || []).map((t) => this.summarise(t)),
             highGoalReached: Boolean(this.highGoalReached),
             inventory: this.bot.entity ? this.inventoryCounts() : {},
+            freeSlots: this.bot.entity ? this.freeSlots() : null,
+            furnaceJobs: this.furnaceJobs.map((j) => ({ input: j.input, output: j.output, count: j.count, readyInSeconds: Math.max(0, Math.round((j.readyAt - Date.now()) / 1000)), position: { x: j.pos.x, y: j.pos.y, z: j.pos.z } })),
+            home: this.home || null,
+            homeDistance: this.homeDistance(),
+            landmarks: this.landmarks,
             triggers,
             recentActions: this.recent,
             trace: this.trace,
@@ -1404,6 +2254,7 @@ class FastLoop {
             fingerprint,
             lastDecision: this.lastDecision,
             stats: this.stats,
+            decisions,
             replayRemaining: this.replay.length,
             replaySource: this.replaySource || null,
             elapsedSeconds: Math.round((Date.now() - this.startedAt) / 1000),
@@ -1425,4 +2276,7 @@ function inject(bot) {
     return bot.fastLoop;
 }
 
-module.exports = { inject, FastLoop, findTargetCandidates, countMatching, matcherFor, loadPrimitives };
+module.exports = {
+    inject, FastLoop, findTargetCandidates, countMatching, matcherFor, loadPrimitives,
+    textTokens, wordForms, phraseIn,
+};

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Any, Dict, Union
 from .file_utils import f_join
@@ -12,6 +13,19 @@ def json_load(*file_path, **kwargs):
 
 def json_loads(string, **kwargs):
     return json.loads(string, **kwargs)
+
+
+def json_load_or(default, *file_path, **kwargs):
+    """Load a JSON checkpoint file, or return ``default`` when it was never written.
+
+    A run stopped before its first task finished has no completed_tasks.json or
+    chest_memory.json; resuming it should start those from empty, not crash.
+    """
+    path = f_join(file_path)
+    if not os.path.exists(path):
+        print(f"\033[33m{path} not found; starting from an empty one\033[0m")
+        return default
+    return json_load(path, **kwargs)
 
 
 def json_dump(data, *file_path, **kwargs):

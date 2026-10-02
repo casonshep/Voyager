@@ -31,7 +31,7 @@ ckpt_dir = RESUME_CKPT_DIR if RESUME else f"ckpt_{time.strftime('%Y%m%d_%H%M%S')
 print(f"Using checkpoint directory: {ckpt_dir}")
 
 voyager = Voyager(
-    mc_port=53202,
+    mc_port=54321,
     openai_api_key=openai_api_key,
     ckpt_dir=ckpt_dir,
     resume=RESUME,
