@@ -7,8 +7,7 @@ GPT time, Jev time, and Minecraft time can be read off a run instead of guessed.
 Usage::
 
     timing.configure(ckpt_dir)
-    llm = ChatOpenAI(..., callbacks=[timing.llm_callback("critic")])
-    with timing.timed("env.step"):
+    with timing.timed("llm.curriculum"):
         ...
 """
 
@@ -20,7 +19,6 @@ import os
 import time
 from typing import Any
 
-from langchain_core.callbacks import BaseCallbackHandler
 
 _log_path: str | None = None
 _totals: dict[str, list[float]] = {}
@@ -63,37 +61,3 @@ def summary() -> dict[str, dict[str, float]]:
         total = sum(samples) / 1000
         out[name] = {"count": len(samples), "total_s": round(total, 1), "mean_s": round(total / len(samples), 2)}
     return out
-
-
-class LLMTimingCallback(BaseCallbackHandler):
-    """Times each LLM request made through a LangChain chat model."""
-
-    def __init__(self, agent: str):
-        self.agent = agent
-        self._starts: dict[Any, float] = {}
-
-    def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
-        self._starts[run_id] = time.perf_counter()
-
-    def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
-        self._starts[run_id] = time.perf_counter()
-
-    def on_llm_end(self, response, *, run_id, **kwargs):
-        started = self._starts.pop(run_id, None)
-        if started is None:
-            return
-        model = None
-        try:
-            model = (response.llm_output or {}).get("model_name")
-        except Exception:
-            pass
-        record(f"llm.{self.agent}", (time.perf_counter() - started) * 1000, model=model)
-
-    def on_llm_error(self, error, *, run_id, **kwargs):
-        started = self._starts.pop(run_id, None)
-        if started is not None:
-            record(f"llm.{self.agent}", (time.perf_counter() - started) * 1000, error=str(error)[:200])
-
-
-def llm_callback(agent: str) -> LLMTimingCallback:
-    return LLMTimingCallback(agent)

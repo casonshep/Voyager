@@ -1,6 +1,6 @@
 // Minecraft facts that are not in minecraft-data recipes: what blocks drop,
 // what smelts into what, what burns, which mob drops which item, and how to
-// read "a set of iron armor". Shared by the fast loop and the goal planner.
+// read "a set of iron armor". Served through GET /knowledge for the decomposer.
 
 const ORE_DROPS = {
     coal_ore: "coal", deepslate_coal_ore: "coal",

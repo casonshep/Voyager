@@ -134,3 +134,7 @@ plot_iter.py
 node_modules/*
 # git worktree checkouts kept inside the repo
 upgrade-movement/
+
+# goal-tree agent: per-machine learned actions and generated reports
+skill_library/tree/
+reports/

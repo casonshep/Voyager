@@ -1,11 +1,9 @@
-"""TypeSafe (Jev) integration: structured state, a guarded client, and judgment gates.
+"""TypeSafe (Jev) integration: a guarded client with jsonl audit logs.
 
-Every gate degrades to a no-op when the client is disabled, so Voyager runs
-unchanged without a ``TYPESAFE_API_KEY``.
+``JevClient.ask`` returns ``None`` when the SDK or ``TYPESAFE_API_KEY`` is
+unavailable or a request fails, so every caller degrades to plain code.
 """
 
-from .state import build_state
 from .client import JevClient
-from .gates import critic_shadow, qa_rank, task_fanout
 
-__all__ = ["build_state", "JevClient", "critic_shadow", "qa_rank", "task_fanout"]
+__all__ = ["JevClient"]

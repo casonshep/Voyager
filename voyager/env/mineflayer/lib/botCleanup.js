@@ -23,12 +23,12 @@ function withTimeout(promise, ms, label) {
 }
 
 async function cleanupBot(bot) {
-    // 0. the fast loop is the only other controller of the bot
-    if (bot.fastLoop) {
+    // 0. the agent loop is the only other controller of the bot
+    if (bot.agentLoop) {
         try {
-            await withTimeout(bot.fastLoop.stop(), PLUGIN_STOP_TIMEOUT_MS * 3, "fastLoop.stop");
+            await withTimeout(bot.agentLoop.stop(), PLUGIN_STOP_TIMEOUT_MS * 3, "agentLoop.stop");
         } catch (err) {
-            console.log("cleanup: fastLoop", err.message);
+            console.log("cleanup: agentLoop", err.message);
         }
     }
     // 1. plugins that drive the pathfinder: ask them to stop first
@@ -83,7 +83,6 @@ async function cleanupBot(bot) {
     bot.globalTickCounter = 0;
     bot.stuckTickCounter = 0;
     bot.stuckPosList = [];
-    bot.jevAskCalls = 0;
     bot.cumulativeObs = [];
     if (Array.isArray(bot.obsList)) {
         for (const o of bot.obsList) {

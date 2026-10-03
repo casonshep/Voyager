@@ -1,15 +1,11 @@
 tqdm
-langchain
 javascript
 setuptools
 openai
 chardet
 python-dotenv
-chromadb==0.3.29
-tiktoken
 typesafe-sdk
 requests
-setuptools
 gymnasium
 psutil
 minecraft_launcher_lib

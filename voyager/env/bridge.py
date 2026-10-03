@@ -1,7 +1,18 @@
+"""Python side of the bot process.
+
+``VoyagerEnv`` launches the mineflayer process, connects the bot (``/start``,
+``/reset``, ``/stop``, ``/pause``) and exposes the agent-loop surface defined
+in PLAN.md section 7: ``knowledge``, ``agent_subtask``, ``agent_status``,
+``agent_verify``, ``agent_primitive`` and ``agent_stop``.
+
+The Minecraft server is never paused by the tree runner (``pause_server`` is
+False there); the bot keeps acting between Python polls.
+"""
+
 import os.path
 import time
 import warnings
-from typing import SupportsFloat, Any, Tuple, Dict
+from typing import Any, Dict, Tuple
 
 import requests
 import json
@@ -25,7 +36,7 @@ class VoyagerEnv(gym.Env):
         server_port=3000,
         request_timeout=600,
         log_path="./logs",
-        pause_server=True,
+        pause_server=False,
         bot_username="bot",
     ):
         if not mc_port and not azure_login:
@@ -42,8 +53,8 @@ class VoyagerEnv(gym.Env):
         self.server_port = server_port
         self.request_timeout = request_timeout
         self.log_path = log_path
-        # When False the Minecraft server is never paused between steps, so the
-        # bot keeps acting while Python thinks (used by the fast loop).
+        # When False the Minecraft server is never paused, so the bot keeps
+        # acting while Python thinks (the tree runner relies on this).
         self.pause_server = pause_server
         self.mineflayer = self.get_mineflayer_process(server_port)
         if azure_login:
@@ -54,6 +65,10 @@ class VoyagerEnv(gym.Env):
         self.reset_options = None
         self.connected = False
         self.server_paused = False
+
+    # ------------------------------------------------------------------ #
+    # process lifecycle
+    # ------------------------------------------------------------------ #
 
     def get_mineflayer_process(self, server_port):
         U.f_mkdir(self.log_path, "mineflayer")
@@ -80,9 +95,6 @@ class VoyagerEnv(gym.Env):
 
     def check_process(self):
         if self.mc_instance and not self.mc_instance.is_running:
-            # if self.mc_instance:
-            #     self.mc_instance.check_process()
-            #     if not self.mc_instance.is_running:
             print("Starting Minecraft server")
             self.mc_instance.run()
             self.mc_port = self.mc_instance.port
@@ -96,6 +108,7 @@ class VoyagerEnv(gym.Env):
                 if retry > 3:
                     raise RuntimeError("Mineflayer process failed to start")
                 else:
+                    retry += 1
                     continue
             print(self.mineflayer.ready_line)
             res = requests.post(
@@ -110,110 +123,68 @@ class VoyagerEnv(gym.Env):
                 )
             return res.json()
 
-    def step(
-        self,
-        code: str,
-        programs: str = "",
-    ) -> Tuple[ObsType, SupportsFloat, bool, bool, Dict[str, Any]]:
-        if not self.has_reset:
-            raise RuntimeError("Environment has not been reset yet")
-        self.check_process()
-        self.unpause()
-        data = {
-            "code": code,
-            "programs": programs,
-        }
-        with timing.timed("env.step"):
-            res = requests.post(
-                f"{self.server}/step", json=data, timeout=self.request_timeout
-            )
-        if res.status_code != 200:
-            raise RuntimeError("Failed to step Minecraft server")
-        returned_data = res.json()
-        self.pause()
-        return json.loads(returned_data)
-
     # ------------------------------------------------------------------ #
-    # Fast loop: a goal-driven controller that runs inside the mineflayer
-    # process. Python posts goals and polls status; the bot never waits
-    # for Python between actions.
+    # agent loop surface (PLAN.md section 7)
     # ------------------------------------------------------------------ #
 
-    def fast_goal(self, goal: Dict[str, Any]) -> Dict[str, Any]:
-        """Replace the fast loop's current goal and (re)start it."""
-        self.check_process()
-        self.unpause()
-        with timing.timed("env.fast_goal"):
-            res = requests.post(f"{self.server}/fast/goal", json=goal, timeout=60)
+    def _post(self, route: str, payload: Dict[str, Any] | None, timeout: int = 60) -> Dict[str, Any]:
+        res = requests.post(f"{self.server}{route}", json=payload if payload is not None else {}, timeout=timeout)
         if res.status_code != 200:
-            raise RuntimeError(f"fast/goal failed: {res.status_code} {res.text[:200]}")
+            raise RuntimeError(f"{route} failed: {res.status_code} {res.text[:200]}")
         return res.json()
 
-    def fast_subgoals(
-        self, text: str, target: Dict[str, Any] = None, check=None, targets=None, extra_targets=None, lookahead=None
-    ) -> Dict[str, Any]:
-        """Candidate subgoals for a high goal, derived in Node from recipes and the world.
+    def _get(self, route: str, timeout: int = 60) -> Dict[str, Any]:
+        res = requests.get(f"{self.server}{route}", timeout=timeout)
+        if res.status_code != 200:
+            raise RuntimeError(f"{route} failed: {res.status_code} {res.text[:200]}")
+        return res.json()
 
-        ``check`` is a list of extra goal targets (remembered skills); the reply's
-        ``satisfied`` list says which of them are already met right now.
+    def knowledge(self) -> Dict[str, Any]:
+        """``GET /knowledge``: recipes, harvest tools and the mcKnowledge tables for the bot's version."""
+        self.check_process()
+        with timing.timed("env.knowledge"):
+            return self._get("/knowledge", timeout=120)
+
+    def agent_subtask(self, node: Dict[str, Any]) -> Dict[str, Any]:
+        """``POST /agent/subtask``: hand the loop one subtask to work on.
+
+        ``node`` carries ``id, description, verify, allowed_blocks, budget_actions, kind``.
+        Posting the same ``id`` again is a retry of that subtask.
         """
-        payload: Dict[str, Any] = {"text": text}
-        if target:
-            payload["target"] = target
-        if check:
-            payload["check"] = check
-        if targets:
-            payload["targets"] = targets  # explicit [{item, count}] decomposition to plan from
-        if extra_targets:
-            payload["extraTargets"] = extra_targets  # requirements learned during execution
-        if lookahead:
-            payload["lookahead"] = lookahead  # next milestone's targets, planned alongside
-        res = requests.post(f"{self.server}/fast/subgoals", json=payload, timeout=60)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/subgoals failed: {res.status_code} {res.text[:200]}")
-        return res.json()
+        self.check_process()
+        self.unpause()
+        with timing.timed("env.agent_subtask"):
+            return self._post("/agent/subtask", node)
 
-    def fast_home(self, pos: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Tell the fast loop where the home base is (or clear it with None)."""
-        res = requests.post(f"{self.server}/fast/home", json=pos or {}, timeout=30)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/home failed: {res.status_code} {res.text[:200]}")
-        return res.json()
+    def agent_status(self) -> Dict[str, Any]:
+        """``GET /agent/status``: snapshot, drained triggers, recent actions, primitives, menu, stats."""
+        return self._get("/agent/status")
 
-    def fast_primitive(self, name: str, source: str, remove: bool = False, repaired: bool = False) -> Dict[str, Any]:
-        """Register (or remove) a runtime action in the bot process; returns {ok, error?, primitives}."""
-        payload: Dict[str, Any] = {"name": name, "source": source, "repaired": repaired}
-        if remove:
-            payload = {"name": name, "remove": True}
-        res = requests.post(f"{self.server}/fast/primitive", json=payload, timeout=30)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/primitive failed: {res.status_code} {res.text[:200]}")
-        return res.json()
+    def agent_verify(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """``POST /agent/verify``: evaluate one VerifySpec against the live world; ``{ok, detail}``."""
+        return self._post("/agent/verify", {"spec": spec})
 
-    def fast_say(self, text: str) -> None:
-        """Have the bot say a line in chat (a short acknowledgement to players)."""
-        res = requests.post(f"{self.server}/fast/say", json={"text": text}, timeout=30)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/say failed: {res.status_code} {res.text[:200]}")
+    def agent_primitive(self, name: str, source: str, purpose: str | None = None) -> Dict[str, Any]:
+        """``POST /agent/primitive``: register a generated action; ``{ok, error}``.
+        ``purpose`` is the subtask it was learned for; Jev sees it on the menu line."""
+        body = {"name": name, "source": source}
+        if purpose:
+            body["purpose"] = purpose
+        return self._post("/agent/primitive", body, timeout=30)
 
-    def fast_status(self) -> Dict[str, Any]:
-        """Drain the fast loop's triggers and observations since the last poll."""
-        res = requests.get(f"{self.server}/fast/status", timeout=60)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/status failed: {res.status_code} {res.text[:200]}")
-        data = res.json()
-        if isinstance(data.get("events"), str):
-            data["events"] = json.loads(data["events"])
-        return data
+    def agent_primitive_remove(self, name: str) -> Dict[str, Any]:
+        """``POST /agent/primitive`` with ``remove``: drop a generated action from the menu."""
+        return self._post("/agent/primitive", {"name": name, "remove": True}, timeout=30)
 
-    def fast_stop(self) -> Dict[str, Any]:
-        """Stop the fast loop; the bot idles until the next goal."""
+    def agent_stop(self) -> Dict[str, Any]:
+        """``POST /agent/stop``: the loop idles and raises no triggers until the next subtask."""
         if not self.mineflayer.is_running:
             return {}
-        res = requests.post(f"{self.server}/fast/stop", timeout=60)
-        if res.status_code != 200:
-            raise RuntimeError(f"fast/stop failed: {res.status_code} {res.text[:200]}")
-        return res.json()
+        return self._post("/agent/stop", None)
+
+    # ------------------------------------------------------------------ #
+    # reset / close / pause
+    # ------------------------------------------------------------------ #
 
     def render(self):
         raise NotImplementedError("render is not implemented")
@@ -226,7 +197,6 @@ class VoyagerEnv(gym.Env):
     ) -> Tuple[ObsType, Dict[str, Any]]:
         if options is None:
             options = {}
-
 
         if options.get("inventory", {}) and options.get("mode", "hard") != "hard":
             raise RuntimeError("inventory can only be set when options is hard")
@@ -257,7 +227,7 @@ class VoyagerEnv(gym.Env):
         self.reset_options["reset"] = "soft"
         self.pause()
 
-        return json.loads(returned_data)
+        return json.loads(returned_data) if isinstance(returned_data, str) else returned_data
 
     def soft_reset(self):
         """Reset the running bot in place instead of restarting mineflayer.
@@ -287,8 +257,11 @@ class VoyagerEnv(gym.Env):
     def close(self):
         self.unpause()
         if self.connected:
-            res = requests.post(f"{self.server}/stop")
-            if res.status_code == 200:
+            try:
+                res = requests.post(f"{self.server}/stop", timeout=30)
+                if res.status_code == 200:
+                    self.connected = False
+            except requests.RequestException:
                 self.connected = False
         if self.mc_instance:
             self.mc_instance.stop()
