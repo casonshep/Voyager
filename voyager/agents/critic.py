@@ -1,6 +1,7 @@
 from voyager.prompts import load_prompt
+from voyager.utils import timing
 from voyager.utils.json_utils import fix_and_parse_json
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 
 
@@ -16,6 +17,7 @@ class CriticAgent:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("critic")],
         )
         assert mode in ["auto", "manual"]
         self.mode = mode

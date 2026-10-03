@@ -10,6 +10,7 @@ import gymnasium as gym
 from gymnasium.core import ObsType
 
 import voyager.utils as U
+from voyager.utils import timing
 
 from .minecraft_launcher import MinecraftInstance
 from .process_monitor import SubprocessMonitor
@@ -24,6 +25,8 @@ class VoyagerEnv(gym.Env):
         server_port=3000,
         request_timeout=600,
         log_path="./logs",
+        pause_server=True,
+        bot_username="bot",
     ):
         if not mc_port and not azure_login:
             raise ValueError("Either mc_port or azure_login must be specified")
@@ -33,10 +36,15 @@ class VoyagerEnv(gym.Env):
             )
         self.mc_port = mc_port
         self.azure_login = azure_login
+        # The in-game name; several bot processes on one server need distinct names.
+        self.bot_username = bot_username
         self.server = f"{server_host}:{server_port}"
         self.server_port = server_port
         self.request_timeout = request_timeout
         self.log_path = log_path
+        # When False the Minecraft server is never paused between steps, so the
+        # bot keeps acting while Python thinks (used by the fast loop).
+        self.pause_server = pause_server
         self.mineflayer = self.get_mineflayer_process(server_port)
         if azure_login:
             self.mc_instance = self.get_mc_instance()
@@ -115,14 +123,97 @@ class VoyagerEnv(gym.Env):
             "code": code,
             "programs": programs,
         }
-        res = requests.post(
-            f"{self.server}/step", json=data, timeout=self.request_timeout
-        )
+        with timing.timed("env.step"):
+            res = requests.post(
+                f"{self.server}/step", json=data, timeout=self.request_timeout
+            )
         if res.status_code != 200:
             raise RuntimeError("Failed to step Minecraft server")
         returned_data = res.json()
         self.pause()
         return json.loads(returned_data)
+
+    # ------------------------------------------------------------------ #
+    # Fast loop: a goal-driven controller that runs inside the mineflayer
+    # process. Python posts goals and polls status; the bot never waits
+    # for Python between actions.
+    # ------------------------------------------------------------------ #
+
+    def fast_goal(self, goal: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace the fast loop's current goal and (re)start it."""
+        self.check_process()
+        self.unpause()
+        with timing.timed("env.fast_goal"):
+            res = requests.post(f"{self.server}/fast/goal", json=goal, timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/goal failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_subgoals(
+        self, text: str, target: Dict[str, Any] = None, check=None, targets=None, extra_targets=None, lookahead=None
+    ) -> Dict[str, Any]:
+        """Candidate subgoals for a high goal, derived in Node from recipes and the world.
+
+        ``check`` is a list of extra goal targets (remembered skills); the reply's
+        ``satisfied`` list says which of them are already met right now.
+        """
+        payload: Dict[str, Any] = {"text": text}
+        if target:
+            payload["target"] = target
+        if check:
+            payload["check"] = check
+        if targets:
+            payload["targets"] = targets  # explicit [{item, count}] decomposition to plan from
+        if extra_targets:
+            payload["extraTargets"] = extra_targets  # requirements learned during execution
+        if lookahead:
+            payload["lookahead"] = lookahead  # next milestone's targets, planned alongside
+        res = requests.post(f"{self.server}/fast/subgoals", json=payload, timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/subgoals failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_home(self, pos: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Tell the fast loop where the home base is (or clear it with None)."""
+        res = requests.post(f"{self.server}/fast/home", json=pos or {}, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/home failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_primitive(self, name: str, source: str, remove: bool = False, repaired: bool = False) -> Dict[str, Any]:
+        """Register (or remove) a runtime action in the bot process; returns {ok, error?, primitives}."""
+        payload: Dict[str, Any] = {"name": name, "source": source, "repaired": repaired}
+        if remove:
+            payload = {"name": name, "remove": True}
+        res = requests.post(f"{self.server}/fast/primitive", json=payload, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/primitive failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
+    def fast_say(self, text: str) -> None:
+        """Have the bot say a line in chat (a short acknowledgement to players)."""
+        res = requests.post(f"{self.server}/fast/say", json={"text": text}, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/say failed: {res.status_code} {res.text[:200]}")
+
+    def fast_status(self) -> Dict[str, Any]:
+        """Drain the fast loop's triggers and observations since the last poll."""
+        res = requests.get(f"{self.server}/fast/status", timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/status failed: {res.status_code} {res.text[:200]}")
+        data = res.json()
+        if isinstance(data.get("events"), str):
+            data["events"] = json.loads(data["events"])
+        return data
+
+    def fast_stop(self) -> Dict[str, Any]:
+        """Stop the fast loop; the bot idles until the next goal."""
+        if not self.mineflayer.is_running:
+            return {}
+        res = requests.post(f"{self.server}/fast/stop", timeout=60)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/stop failed: {res.status_code} {res.text[:200]}")
+        return res.json()
 
     def render(self):
         raise NotImplementedError("render is not implemented")
@@ -136,11 +227,13 @@ class VoyagerEnv(gym.Env):
         if options is None:
             options = {}
 
+
         if options.get("inventory", {}) and options.get("mode", "hard") != "hard":
             raise RuntimeError("inventory can only be set when options is hard")
 
         self.reset_options = {
             "port": self.mc_port,
+            "username": self.bot_username,
             "reset": options.get("mode", "hard"),
             "inventory": options.get("inventory", {}),
             "equipment": options.get("equipment", []),
@@ -150,16 +243,46 @@ class VoyagerEnv(gym.Env):
         }
 
         self.unpause()
-        self.mineflayer.stop()
-        time.sleep(1)  # wait for mineflayer to exit
-
-        returned_data = self.check_process()
+        returned_data = None
+        with timing.timed("env.reset", mode=self.reset_options["reset"]):
+            if self.reset_options["reset"] == "soft":
+                returned_data = self.soft_reset()
+            if returned_data is None:
+                self.mineflayer.stop()
+                time.sleep(1)  # wait for mineflayer to exit
+                returned_data = self.check_process()
         self.has_reset = True
         self.connected = True
         # All the reset in step will be soft
         self.reset_options["reset"] = "soft"
         self.pause()
+
         return json.loads(returned_data)
+
+    def soft_reset(self):
+        """Reset the running bot in place instead of restarting mineflayer.
+
+        Returns the observation JSON string, or None when no bot is connected or
+        the in-process reset failed, in which case the caller falls back to a
+        full process restart.
+        """
+        if not (self.connected and self.mineflayer.is_running):
+            return None
+        try:
+            res = requests.post(
+                f"{self.server}/reset",
+                json=self.reset_options,
+                timeout=self.request_timeout,
+            )
+        except requests.RequestException as e:
+            print(f"In-process reset failed ({e}); restarting mineflayer")
+            return None
+        if res.status_code != 200:
+            print(
+                f"In-process reset returned {res.status_code}; restarting mineflayer"
+            )
+            return None
+        return res.json()
 
     def close(self):
         self.unpause()
@@ -173,6 +296,8 @@ class VoyagerEnv(gym.Env):
         return not self.connected
 
     def pause(self):
+        if not self.pause_server:
+            return False
         if self.mineflayer.is_running and not self.server_paused:
             res = requests.post(f"{self.server}/pause")
             if res.status_code == 200:

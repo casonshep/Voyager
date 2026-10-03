@@ -67,12 +67,25 @@ async function collectAll(
                             );
                             // @ts-ignore
                         } else if (err.name === "NoItem") {
+                            if (!closest.name) {
+                                bot.chat(`Block has no name, skipping...`);
+                                break;
+                            }
                             const properties =
                                 bot.registry.blocksByName[closest.name];
+                            if (!properties.harvestTools) {
+                                bot.chat(`No harvest tool defined for block ${name}, skipping...`);
+                                break;
+                            }
                             const leastTool = Object.keys(
                                 properties.harvestTools
                             )[0];
-                            const item = bot.registry.items[leastTool];
+                            const toolId = parseInt(leastTool, 10);
+                            if (isNaN(toolId)) {
+                                bot.chat(`Could not parse tool ID for ${leastTool}`);
+                                break;
+                            }
+                            const item = bot.registry.items[toolId];
                             bot.chat(
                                 `I need at least a ${item.name} to mine ${closest.name}!  Skip it!`
                             );
@@ -177,12 +190,17 @@ async function mineBlock(
     block: Block,
     options: CollectOptionsFull
 ): Promise<void> {
-    if (
-        bot.blockAt(block.position)?.type !== block.type ||
-        bot.blockAt(block.position)?.type === 0
-    ) {
+    const currentBlock = bot.blockAt(block.position);
+    console.log('Current block at position:', {
+        position: block.position,
+        expectedType: block.type,
+        actualType: currentBlock?.type,
+        block: currentBlock
+    });
+    
+    if (!currentBlock || currentBlock.type !== block.type || currentBlock.type === 0) {
         options.targets.removeTarget(block);
-        throw error("Invalid block", "Block is not valid!");
+        throw error("Invalid block", `Block is not valid! Expected type ${block.type}, got ${currentBlock?.type}`);
         // @ts-expect-error
     } else if (!bot.pathfinder.movements.safeToBreak(block)) {
         options.targets.removeTarget(block);

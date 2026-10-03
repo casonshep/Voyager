@@ -1,12 +1,13 @@
 import os
 
 import voyager.utils as U
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain.schema import HumanMessage, SystemMessage
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 from voyager.prompts import load_prompt
+from voyager.utils import timing
 from voyager.control_primitives import load_control_primitives
 
 
@@ -24,6 +25,7 @@ class SkillManager:
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("skill")],
         )
         U.f_mkdir(f"{ckpt_dir}/skill/code")
         U.f_mkdir(f"{ckpt_dir}/skill/description")
@@ -32,7 +34,7 @@ class SkillManager:
         self.control_primitives = load_control_primitives()
         if resume:
             print(f"\033[33mLoading Skill Manager from {ckpt_dir}/skill\033[0m")
-            self.skills = U.load_json(f"{ckpt_dir}/skill/skills.json")
+            self.skills = U.json_load_or({}, f"{ckpt_dir}/skill/skills.json")
         else:
             self.skills = {}
         self.retrieval_top_k = retrieval_top_k
@@ -97,7 +99,8 @@ class SkillManager:
             f"{self.ckpt_dir}/skill/description/{dumped_program_name}.txt",
         )
         U.dump_json(self.skills, f"{self.ckpt_dir}/skill/skills.json")
-        self.vectordb.persist()
+        # self.vectordb.save_local(self.ckpt_dir + "/skill/vectordb")
+
 
     def generate_skill_description(self, program_name, program_code):
         messages = [

@@ -5,6 +5,7 @@ const mineflayer = require("mineflayer");
 
 const skills = require("./lib/skillLoader");
 const { initCounter, getNextTime } = require("./lib/utils");
+const { cleanupBot } = require("./lib/botCleanup");
 const obs = require("./lib/observation/base");
 const OnChat = require("./lib/observation/onChat");
 const OnError = require("./lib/observation/onError");
@@ -22,6 +23,15 @@ const app = express();
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb", extended: false }));
 
+// A throw inside a packet handler or a timer callback would otherwise end the
+// process (the signed-chat crash did exactly that). Log it and keep the bot.
+process.on("uncaughtException", (err) => {
+    console.log("uncaughtException (bot kept alive):", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (err) => {
+    console.log("unhandledRejection (ignored):", err && err.stack ? err.stack : err);
+});
+
 app.post("/start", (req, res) => {
     if (bot) onDisconnect("Restarting bot");
     bot = null;
@@ -29,7 +39,7 @@ app.post("/start", (req, res) => {
     bot = mineflayer.createBot({
         host: "localhost", // minecraft server ip
         port: req.body.port, // minecraft server port
-        username: "bot",
+        username: req.body.username || "bot", // each bot process has its own name
         disableChatSigning: true,
         checkTimeoutInterval: 60 * 60 * 1000,
     });
@@ -99,15 +109,20 @@ app.post("/start", (req, res) => {
         const tool = require("mineflayer-tool").plugin;
         const collectBlock = require("mineflayer-collectblock").plugin;
         const pvp = require("mineflayer-pvp").plugin;
-        const minecraftHawkEye = require("minecrafthawkeye");
+        console.log("HawkEye import:", require("minecrafthawkeye"));
+
+        const minecraftHawkEye = require("minecrafthawkeye").plugin;
         bot.loadPlugin(pathfinder);
         bot.loadPlugin(tool);
         bot.loadPlugin(collectBlock);
         bot.loadPlugin(pvp);
-        bot.loadPlugin(minecraftHawkEye);
+        // bot.loadPlugin(minecraftHawkEye);
 
         // bot.collectBlock.movements.digCost = 0;
         // bot.collectBlock.movements.placeCost = 0;
+
+        require("./lib/jevTraversal").inject(bot);
+        require("./lib/fastLoop").inject(bot);
 
         obs.inject(bot, [
             OnChat,
@@ -146,6 +161,37 @@ app.post("/start", (req, res) => {
         bot.end();
         console.log(message);
         bot = null;
+    }
+});
+
+// In-process reset between tasks: clear everything generated code may have
+// left on the long-lived bot without tearing down the Node process. Returns
+// an observation like /start so the Python bridge can treat both the same.
+app.post("/reset", async (req, res) => {
+    if (!bot || !bot.entity) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        bot.waitTicks = req.body.waitTicks || bot.waitTicks;
+        await cleanupBot(bot);
+        if (req.body.position) {
+            bot.chat(
+                `/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`
+            );
+        }
+        if (req.body.spread) {
+            bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
+            await bot.waitForTicks(bot.waitTicks);
+        }
+        bot.iron_pickaxe = Boolean(
+            bot.inventory.items().find((item) => item.name === "iron_pickaxe")
+        );
+        await bot.waitForTicks(bot.waitTicks);
+        res.json(bot.observe());
+    } catch (err) {
+        console.log("reset failed:", err);
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
     }
 });
 
@@ -235,6 +281,9 @@ app.post("/step", async (req, res) => {
     const code = req.body.code;
     const programs = req.body.programs;
     bot.cumulativeObs = [];
+    bot.jevAskCalls = 0;
+    // generated code and the fast loop must never drive the bot at once
+    if (bot.fastLoop) await bot.fastLoop.stop();
     await bot.waitForTicks(bot.waitTicks);
     const r = await evaluateCode(code, programs);
     process.off("uncaughtException", otherError);
@@ -251,12 +300,33 @@ app.post("/step", async (req, res) => {
     bot.removeListener("physicTick", onTick);
 
     async function evaluateCode(code, programs) {
-        // Echo the code produced for players to see it. Don't echo when the bot code is already producing dialog or it will double echo
+        // Timers started by the program (or by primitives it calls) are tracked
+        // so nothing keeps ticking after the program finishes. The shim must stay
+        // on the first line: handleError maps stack line numbers relative to
+        // `programs`, so adding lines here would shift every reported line.
+        const timers = new Set();
+        const trackedSetTimeout = (fn, ms, ...args) => {
+            const id = setTimeout(fn, ms, ...args);
+            timers.add(id);
+            return id;
+        };
+        const trackedSetInterval = (fn, ms, ...args) => {
+            const id = setInterval(fn, ms, ...args);
+            timers.add(id);
+            return id;
+        };
+        const shim =
+            "const setTimeout = trackedSetTimeout; const setInterval = trackedSetInterval; ";
         try {
-            await eval("(async () => {" + programs + "\n" + code + "})()");
+            await eval("(async () => {" + shim + programs + "\n" + code + "})()");
             return "success";
         } catch (err) {
             return err;
+        } finally {
+            for (const id of timers) {
+                clearTimeout(id);
+                clearInterval(id);
+            }
         }
     }
 
@@ -395,6 +465,112 @@ app.post("/step", async (req, res) => {
             return source + err.message + "\n" + code_source;
         }
         return err.message;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Fast loop endpoints (see lib/fastLoop.js). Python posts a goal and polls
+// status; the bot keeps acting between polls and the server is never paused.
+// ---------------------------------------------------------------------------
+app.post("/fast/goal", async (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const status = await bot.fastLoop.setGoal(req.body || {});
+        res.json(status);
+    } catch (err) {
+        console.log("fast/goal failed:", err);
+        res.status(400).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.post("/fast/subgoals", async (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const body = req.body || {};
+        const override = Array.isArray(body.targets) ? { targets: body.targets } : body.target;
+        const result = await bot.fastLoop.deriveSubgoals(String(body.text || ""), override, body.extraTargets, body.lookahead);
+        if (Array.isArray(body.check)) result.satisfied = await bot.fastLoop.checkSatisfied(body.check);
+        res.json(result);
+    } catch (err) {
+        console.log("fast/subgoals failed:", err);
+        res.status(400).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.post("/fast/home", (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    const b = req.body || {};
+    bot.fastLoop.setHome(b.x !== undefined ? b : null);
+    res.json({ home: bot.fastLoop.home });
+});
+
+// Register (or replace) a runtime action; the brain generates these. Returns
+// the exact compile or check error so the generator can retry with it.
+app.post("/fast/primitive", (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    const b = req.body || {};
+    if (b.remove) {
+        res.json({ ok: bot.fastLoop.registry.remove(String(b.name || "")) });
+        return;
+    }
+    let snap = null;
+    try {
+        snap = bot.entity ? bot.fastLoop.snapshot() : null;
+    } catch (err) {
+        snap = null;
+    }
+    const result = bot.fastLoop.registry.register(String(b.name || ""), String(b.source || ""), snap);
+    if (result.ok && b.repaired) bot.fastLoop.registry.markRepaired(String(b.name));
+    res.json({ ...result, primitives: bot.fastLoop.registry.summary() });
+});
+
+app.post("/fast/say", (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    bot.fastLoop.say((req.body || {}).text);
+    res.json({ ok: true });
+});
+
+app.get("/fast/status", (req, res) => {
+    if (!bot || !bot.entity || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    try {
+        const status = bot.fastLoop.status();
+        // bot.observe() drains cumulativeObs; this is its only caller in fast mode
+        status.events = bot.observe();
+        res.json(status);
+    } catch (err) {
+        console.log("fast/status failed:", err);
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.post("/fast/stop", async (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.json({ running: false });
+        return;
+    }
+    try {
+        await bot.fastLoop.stop();
+        res.json({ running: false });
+    } catch (err) {
+        res.status(500).json({ error: String(err && err.message ? err.message : err) });
     }
 });
 

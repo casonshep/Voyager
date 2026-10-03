@@ -38,7 +38,8 @@ Code:
     4) Functions in the "Code from the last round" section will not be saved or executed. Do not reuse functions listed there.
     5) Anything defined outside a function will be ignored, define all your variables inside your functions.
     6) Call `bot.chat` to show the intermediate progress.
-    7) Use `exploreUntil(bot, direction, maxDistance, callback)` when you cannot find something. You should frequently call this before mining blocks or killing mobs. You should select a direction at random every time instead of constantly using (1, 0, 1).
+    7) Use `exploreUntil(bot, direction, maxTime, callback, objective)` when you cannot find something. You should frequently call this before mining blocks or killing mobs. You should select a direction at random every time instead of constantly using (1, 0, 1), and always pass a short `objective` string.
+    7b) Use `askJev(bot, question, options, context)` only for judgment calls: choosing between several candidates, deciding whether it is safe to continue, or choosing where to place something. Never use it to check the inventory, whether a block or mob exists, or any other exact fact; use ordinary code for those. It can return null, so always keep a plain-code default. Do not call it inside loops.
     8) `maxDistance` should always be 32 for `bot.findBlocks` and `bot.findBlock`. Do not cheat.
     9) Do not write infinite loops or recursive functions.
     10) Do not use `bot.on` or `bot.once` to register event listeners. You definitely do not need them.

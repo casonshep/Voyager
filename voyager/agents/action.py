@@ -3,11 +3,12 @@ import time
 
 import voyager.utils as U
 from javascript import require
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.prompts import SystemMessagePromptTemplate
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 
 from voyager.prompts import load_prompt
+from voyager.utils import timing
 from voyager.control_primitives_context import load_control_primitives_context
 
 
@@ -28,13 +29,14 @@ class ActionAgent:
         U.f_mkdir(f"{ckpt_dir}/action")
         if resume:
             print(f"\033[32mLoading Action Agent from {ckpt_dir}/action\033[0m")
-            self.chest_memory = U.load_json(f"{ckpt_dir}/action/chest_memory.json")
+            self.chest_memory = U.json_load_or({}, f"{ckpt_dir}/action/chest_memory.json")
         else:
             self.chest_memory = {}
         self.llm = ChatOpenAI(
             model_name=model_name,
             temperature=temperature,
             request_timeout=request_timout,
+            callbacks=[timing.llm_callback("action")],
         )
 
     def update_chest_memory(self, chests):
@@ -82,6 +84,7 @@ class ActionAgent:
             "placeItem",
             "smeltItem",
             "killMob",
+            "askJev",
         ]
         if not self.llm.model_name == "gpt-3.5-turbo":
             base_skills += [
