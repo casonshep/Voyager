@@ -44,8 +44,26 @@ const NO_PROGRESS_DEFAULT_S = 120;
 const NO_PROGRESS_DEFAULT_ACTIONS = 12;
 const MAX_SUBGOAL_CANDIDATES = 8;
 const STUCK_WINDOW_ACTIONS = 4;
+const CANOPY_RE = /_leaves$|_log$|_wood$|^vine$|mushroom_block$|_stem$|^bamboo$|^cactus$|_sapling$/; // tree matter is not a roof
+const TOOL_KIND_RE = /_(pickaxe|axe|sword|shovel|hoe)$/;
+const TOOL_TIERS = ["wooden", "stone", "golden", "iron", "diamond", "netherite"];
+const HELD_ONCE_RE = /_(pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots)$|^shield$|^bow$|^bucket$|^shears$|^crafting_table$|^furnace$|^chest$/; // craft again only when the goal asks
+const ACTION_COOLDOWN_DECISIONS = 4; // an action that failed instantly or looked stuck is off the menu this long
+const INSTANT_FAIL_MS = 1000;
+const SAFETY_ACTIONS = new Set(["eat", "flee"]);
 const STUCK_DISTANCE = 1.5;
 const RECENT_ACTIONS = 5;
+const TOSSED_IGNORE_MS = 6 * 60 * 1000; // dropped stacks the bot threw away are not loot for this long
+const { PrimitiveRegistry } = require("./primitiveRegistry");
+const MINE_BATCH_MAX = 8; // blocks per mine action at most
+const MINE_BLOCK_TIMEOUT_MS = 10000; // one block inside a batch
+const MINE_BATCH_TIMEOUT_MS = 45000; // the whole batch
+const REACH_DISTANCE = 4.5; // blocks the bot can dig without walking
+const BRIDGE_MAX_BLOCKS = 12;
+const PRIMITIVE_TIMEOUT_MS = 20000; // a registered (generated) action
+const PARAM_VERBS = ["walk", "mine", "craft", "attack", "smelt", "place", "equip", "return", "withdraw"];
+const PLACEABLE_RE = /^(cobblestone|dirt|cobbled_deepslate|netherrack|stone|andesite|diorite|granite|.*_planks)$/;
+const COUNT_BUCKETS = { one: 1, four: 4, eight: 8 };
 const RESOURCE_SCAN_DISTANCE = 24;
 const MAX_MENU_MINE = 5;
 const MAX_MENU_CRAFT = 4;
@@ -282,6 +300,13 @@ class FastLoop {
         this.home = null; // {x, y, z} of the home base (crafting table, furnace, chest), set by the brain
         this.furnaceJobs = []; // batches cooking: {pos, input, output, count, loadedAt, readyAt}
         this.playerChat = []; // chat lines from players since the last status poll, drained by status()
+        this.registry = new PrimitiveRegistry(this); // runtime-registered actions (x:<name>)
+        this.pendingCount = null; // mine batch size chosen by Jev for the next mine action
+        this.tossed = new Map(); // item entity id -> time it was thrown away (ignored by the drop scan)
+        this.cooldowns = new Map(); // action id -> decisions left before it is offered again
+        this.stuckStreak = 0; // consecutive Jev "stuck" verdicts
+        this.primitiveOutcomes = []; // outcomes of generated (x:) actions, drained by status()
+        this.canClear = null; // whether /clear works for this bot (operator); learned on first discard
         this.listenForPlayers();
     }
 
@@ -477,8 +502,10 @@ class FastLoop {
 
     droppedItems() {
         const here = this.bot.entity.position;
+        const now = Date.now();
+        for (const [id, at] of this.tossed) if (now - at > TOSSED_IGNORE_MS) this.tossed.delete(id);
         return Object.values(this.bot.entities)
-            .filter((e) => e.name === "item" && e.position && e.position.distanceTo(here) <= COLLECT_DISTANCE)
+            .filter((e) => e.name === "item" && e.position && !this.tossed.has(e.id) && e.position.distanceTo(here) <= COLLECT_DISTANCE)
             .sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here));
     }
 
@@ -644,10 +671,13 @@ class FastLoop {
     }
 
     // Is there open sky above these feet (no solid block overhead)?
+    // A dark forest canopy is not a roof: leaves, logs and plants overhead do not
+    // make the bot "underground" (that mistake had it digging a staircase to a
+    // surface it was already standing on, 1178 times in one run).
     skyAbove(feet) {
         for (let dy = 2; dy < 90 && feet.y + dy < 320; dy++) {
             const b = this.bot.blockAt(feet.offset(0, dy, 0));
-            if (b && b.boundingBox === "block") return false;
+            if (b && b.boundingBox === "block" && !CANOPY_RE.test(b.name)) return false;
         }
         return true;
     }
@@ -656,7 +686,7 @@ class FastLoop {
         let n = 0;
         for (let dy = 2; dy < 90 && feet.y + dy < 320; dy++) {
             const b = this.bot.blockAt(feet.offset(0, dy, 0));
-            if (b && b.boundingBox === "block") n++;
+            if (b && b.boundingBox === "block" && !CANOPY_RE.test(b.name)) n++;
         }
         return n;
     }
@@ -671,15 +701,19 @@ class FastLoop {
         let di = ((Math.round((bot.entity.yaw || 0) / (Math.PI / 2)) % 4) + 4) % 4;
         let steps = 0;
         let stalled = 0;
+        let turns = 0; // consecutive turns without a dig or a step
+        let climbed = 0;
         for (; steps < 48; steps++) {
             if (!this.active || isAborted()) return `interrupted after ${steps} steps`;
+            if (turns >= 4) return `failed: nothing to step onto in any direction (open air around; not underground?)`;
             const feet = bot.entity.position.floored();
-            if (this.skyAbove(feet)) return `ok, reached the surface after ${steps} steps`;
+            if (this.skyAbove(feet)) return `ok, reached the surface after ${climbed} steps`;
             const [dx, dz] = dirs[di];
             const toClear = [feet.offset(0, 2, 0), feet.offset(dx, 1, dz), feet.offset(dx, 2, dz), feet.offset(dx, 3, dz)];
             const danger = toClear.concat([feet.offset(dx, 0, dz)]).some((p) => /lava|water/.test(((bot.blockAt(p) || {}).name) || ""));
             if (danger) {
                 di = (di + 1) % 4; // turn away from liquids
+                turns++;
                 continue;
             }
             for (const p of toClear) {
@@ -696,8 +730,11 @@ class FastLoop {
             const tread = bot.blockAt(feet.offset(dx, 0, dz));
             if (!tread || tread.boundingBox !== "block") {
                 di = (di + 1) % 4; // nothing to stand on ahead: turn
+                turns++;
                 continue;
             }
+            turns = 0;
+            climbed++;
             try {
                 await withTimeout(bot.pathfinder.goto(new goals.GoalBlock(feet.x + dx, feet.y + 1, feet.z + dz)), 6000, "staircase step");
             } catch (err) {
@@ -716,18 +753,52 @@ class FastLoop {
                 stalled = 0;
             }
         }
-        return `ok, climbed ${steps} steps, surface not yet reached`;
+        return climbed ? `ok, climbed ${climbed} steps, surface not yet reached` : "failed: could not climb at all";
     }
 
     // Items to put away: everything the keep table does not want, and the
     // excess above a cap for bulk items; never the goal targets or food.
+    // Tools: keep the best of each kind and one spare pickaxe; 16 wooden
+    // pickaxes are junk, not a kit.
+    excessTools(inventory) {
+        const out = {};
+        const byKind = {};
+        for (const [name, count] of Object.entries(inventory)) {
+            const m = TOOL_KIND_RE.exec(name);
+            if (!m) continue;
+            const tier = TOOL_TIERS.indexOf(name.slice(0, -m[0].length));
+            if (tier < 0) continue;
+            (byKind[m[1]] = byKind[m[1]] || []).push({ name, count, tier });
+        }
+        const targets = [this.target, ...(this.highTargets || [])].filter(Boolean);
+        for (const [kind, items] of Object.entries(byKind)) {
+            items.sort((a, b) => b.tier - a.tier);
+            let keep = kind === "pickaxe" ? 2 : 1;
+            // a goal that asks for N of this tool kind (Basic kit: 2 pickaxes) raises the floor
+            for (const t of targets) {
+                if (t.matches && items.some((it) => t.matches(it.name))) keep = Math.max(keep, t.need || 1);
+            }
+            for (const it of items) {
+                const kept = Math.min(keep, it.count);
+                keep -= kept;
+                if (it.count > kept) out[it.name] = it.count - kept;
+            }
+        }
+        return out;
+    }
+
     junkToDeposit(inventory) {
         const out = {};
         const wanted = (name) =>
             (this.target && this.target.matches(name)) ||
             (this.highTargets || []).some((t) => t.matches && t.matches(name)) ||
             EDIBLE.includes(name);
+        const extraTools = this.excessTools(inventory);
         for (const [name, count] of Object.entries(inventory)) {
+            if (extraTools[name]) {
+                out[name] = extraTools[name]; // beyond the keep floor even when a goal wants this kind
+                continue;
+            }
             if (wanted(name)) continue;
             let cap = KEEP_CAP[name];
             if (cap === undefined) {
@@ -949,8 +1020,11 @@ class FastLoop {
         try {
             const { Movements } = require("mineflayer-pathfinder");
             const m = new Movements(this.bot, this.mcData);
-            m.allow1by1towers = false;
-            m.scafoldingBlocks = [];
+            m.allow1by1towers = false; // jump placement was rejected by the server
+            // horizontal bridging over gaps and water uses carried filler blocks
+            m.scafoldingBlocks = Object.values(this.mcData.itemsByName)
+                .filter((it) => PLACEABLE_RE.test(it.name))
+                .map((it) => it.id);
             m.canDig = true;
             this.bot.pathfinder.setMovements(m);
             this.movements = m;
@@ -964,6 +1038,13 @@ class FastLoop {
         if (this.movements && this.bot.pathfinder) this.bot.pathfinder.setMovements(this.movements); // /step resets them
         if (!goal || typeof goal.text !== "string" || !goal.text.trim()) {
             throw new Error("goal.text must be a non-empty string");
+        }
+        if (
+            goal.kind === "task" && goal.highGoal && goal.highGoal.text === goal.text && !goal.target &&
+            goal.highGoal.source !== "chat" && Array.isArray(goal.highGoal.targets) && goal.highGoal.targets.length
+        ) {
+            // Jev would read "Home base" with no target as "be at home" and walk in circles
+            throw new Error(`subgoal "${goal.text}" is its high goal's name with no target: the plan found no step`);
         }
         await this.interrupt();
         this.goal = {
@@ -1277,6 +1358,320 @@ class FastLoop {
         };
     }
 
+    // ---- parameterised menu ------------------------------------------------
+    // The flat menu (id -> description) stays the source of truth for execution,
+    // replay and skills. For Jev it is folded into one verb Choice plus one
+    // speculative parameter Choice per verb that has several targets.
+    foldMenu(menu) {
+        const groups = {};
+        for (const id of Object.keys(menu)) {
+            const i = id.indexOf(":");
+            const verb = i > 0 ? id.slice(0, i) : id;
+            if (i > 0 && PARAM_VERBS.includes(verb)) (groups[verb] = groups[verb] || []).push(id);
+        }
+        const verbs = {};
+        const params = {};
+        for (const id of Object.keys(menu)) {
+            const i = id.indexOf(":");
+            const verb = i > 0 ? id.slice(0, i) : id;
+            if (groups[verb] && groups[verb].length > 1) {
+                if (verbs[verb]) continue;
+                const facts = groups[verb].map((k) => `${k.slice(verb.length + 1)}: ${menu[k]}`);
+                verbs[verb] = `${verb} one of ${groups[verb].length} targets (exact target chosen separately): ` + facts.join(" | ");
+                params[verb] = {};
+                for (const k of groups[verb]) params[verb][k.slice(verb.length + 1)] = menu[k];
+            } else {
+                verbs[id] = menu[id];
+            }
+        }
+        return { verbs, params };
+    }
+
+    wantsCount(menu) {
+        return Object.keys(menu).some((k) => k.startsWith("mine:"));
+    }
+
+    composeAction(answers, fold, menu) {
+        const a = answers.action;
+        let choice = a.choice;
+        let param = null;
+        if (fold.params[choice]) {
+            const p = answers[`param_${choice}`];
+            const keys = Object.keys(fold.params[choice]);
+            param = p && fold.params[choice][p.choice] !== undefined ? p.choice : keys[0];
+            choice = `${choice}:${param}`;
+        }
+        return { choice, verb: a.choice, param, confidence: a.confidence, probabilities: a.probabilities, inMenu: Boolean(menu[choice]) };
+    }
+
+    // ---- discarding junk --------------------------------------------------------
+    // Tossed stacks at the feet were picked straight back up on the next walk and
+    // offered again as loot. Operators delete junk with /clear (nothing hits the
+    // ground); otherwise the stacks are tossed and their entity ids ignored by the
+    // drop scan for a while.
+    async discardJunk() {
+        const bot = this.bot;
+        const junk = this.junkToDeposit(this.inventoryCounts());
+        const names = Object.keys(junk);
+        if (!names.length) return "failed: nothing to discard";
+        let cleared = 0;
+        if (this.canClear !== false && typeof bot.chat === "function") {
+            for (const [name, count] of Object.entries(junk)) {
+                const before = this.inventoryCounts()[name] || 0;
+                bot.chat(`/clear @s minecraft:${name} ${count}`);
+                await sleep(350);
+                let after = this.inventoryCounts()[name] || 0;
+                if (after >= before) {
+                    await sleep(400); // one slow tick must not disable /clear for the whole run
+                    after = this.inventoryCounts()[name] || 0;
+                }
+                if (after < before) {
+                    cleared++;
+                    this.canClear = true;
+                } else {
+                    this.canClear = false; // not an operator here: fall back to tossing
+                    break;
+                }
+            }
+            if (cleared && this.canClear) return `ok, deleted ${cleared} kind(s) of junk with /clear, ${this.freeSlots()} slots free`;
+        }
+        let tossed = 0;
+        for (const [name, count] of Object.entries(junk)) {
+            if ((this.inventoryCounts()[name] || 0) === 0) continue; // already cleared
+            const def = this.mcData.itemsByName[name];
+            if (!def) continue;
+            const knownIds = new Set(Object.values(bot.entities || {}).filter((e) => e.name === "item").map((e) => e.id));
+            try {
+                await withTimeout(bot.toss(def.id, null, count), 4000, "toss");
+                tossed++;
+                await sleep(300);
+                for (const e of Object.values(bot.entities || {})) {
+                    if (e.name === "item" && !knownIds.has(e.id)) this.tossed.set(e.id, Date.now());
+                }
+            } catch (err) {
+                /* next item */
+            }
+        }
+        if (tossed) return `ok, tossed ${tossed} kind(s) of junk (ignored by the loot scan from now on), ${this.freeSlots()} slots free`;
+        return cleared ? `ok, deleted ${cleared} kind(s) of junk, ${this.freeSlots()} slots free` : "failed: nothing discarded";
+    }
+
+    // ---- batch mining ---------------------------------------------------------
+    placeableCount() {
+        const inv = this.inventoryCounts();
+        return Object.entries(inv).reduce((s, [n, c]) => (PLACEABLE_RE.test(n) ? s + c : s), 0);
+    }
+
+    nearestBlocks(matches, maxDistance, count) {
+        const ids = [];
+        for (const [name, block] of Object.entries(this.mcData.blocksByName)) if (matches(name)) ids.push(block.id);
+        if (!ids.length) return [];
+        const here = this.bot.entity.position;
+        return this.bot
+            .findBlocks({ matching: ids, maxDistance, count })
+            .map((p) => this.bot.blockAt(p))
+            .filter(Boolean)
+            .sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here));
+    }
+
+    // Blocks of the same family touching `block` (a tree's logs, an ore vein), nearest first.
+    connectedSameFamily(block, matches, limit = 16) {
+        const seen = new Set([block.position.toString()]);
+        const out = [];
+        const queue = [block];
+        while (queue.length && out.length < limit) {
+            const b = queue.shift();
+            for (let dx = -1; dx <= 1; dx++)
+                for (let dy = -1; dy <= 1; dy++)
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (!dx && !dy && !dz) continue;
+                        const p = b.position.offset(dx, dy, dz);
+                        const key = p.toString();
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        const nb = this.bot.blockAt(p);
+                        if (nb && matches(nb.name)) {
+                            out.push(nb);
+                            queue.push(nb);
+                        }
+                    }
+        }
+        return out;
+    }
+
+    // Dig a block within arm's reach without the pathfinder, then step onto its
+    // spot so the drop is picked up. Returns "ok" or a reason.
+    async reachDig(block) {
+        const bot = this.bot;
+        const { goals } = require("mineflayer-pathfinder");
+        if (!bot.canDigBlock || !bot.canDigBlock(block)) return "failed: cannot dig that block from here";
+        try {
+            if (bot.tool && bot.tool.equipForBlock) await withTimeout(bot.tool.equipForBlock(block, { requireHarvest: true }), 3000, "equip");
+        } catch (e) {
+            /* dig with what is held */
+        }
+        if (typeof block.canHarvest === "function" && !block.canHarvest(bot.heldItem ? bot.heldItem.type : null)) {
+            return `failed: the held tool cannot harvest ${block.name}`;
+        }
+        await withTimeout(bot.dig(block), MINE_BLOCK_TIMEOUT_MS, `dig ${block.name}`);
+        const p = block.position;
+        try {
+            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(p.x, p.y, p.z, 1)), 4000, "pickup");
+        } catch (e) {
+            /* the drop may still land on us */
+        }
+        await sleep(250);
+        return "ok";
+    }
+
+    // Up to `count` blocks matching `name` in one action: reach-dig what is in
+    // arm's reach (following a tree or vein), otherwise the collect plugin walks.
+    async mineBatch(name, count) {
+        const bot = this.bot;
+        const matches = matcherFor(name);
+        const started = Date.now();
+        const goalId = this.goal ? this.goal.id : null;
+        const before = this.inventoryCounts();
+        let dug = 0;
+        let lastReason = null;
+        while (dug < count) {
+            if (!this.active || !this.goal || this.goal.id !== goalId) break;
+            if (Date.now() - started > MINE_BATCH_TIMEOUT_MS) {
+                lastReason = "batch time is up";
+                break;
+            }
+            const here = bot.entity.position;
+            const candidates = this.nearestBlocks(matches, RESOURCE_SCAN_DISTANCE, 64);
+            if (!candidates.length) {
+                lastReason = `no ${name} within ${RESOURCE_SCAN_DISTANCE} blocks`;
+                break;
+            }
+            const eye = here.offset(0, 1.6, 0);
+            const inReach = candidates.filter((b) => b.position.offset(0.5, 0.5, 0.5).distanceTo(eye) <= REACH_DISTANCE);
+            try {
+                if (inReach.length) {
+                    const r = await this.reachDig(inReach[0]);
+                    if (r !== "ok") {
+                        lastReason = r;
+                        break;
+                    }
+                } else {
+                    this.abortCurrent = () => {
+                        try {
+                            bot.collectBlock.cancelTask();
+                        } catch (e) {
+                            /* ignore */
+                        }
+                        bot.pathfinder.setGoal(null);
+                    };
+                    await withTimeout(this.prims.mineBlock(bot, name, 1), MINE_TIMEOUT_MS, `mine:${name}`);
+                }
+            } catch (err) {
+                lastReason = /timed out/.test(err.message) ? "timeout" : `failed: ${err.message.split("\n")[0].slice(0, 60)}`;
+                if (/timed out/.test(err.message)) await this.cancelCurrentTask();
+                break;
+            }
+            dug++;
+        }
+        const after = this.inventoryCounts();
+        const gained = Object.keys(after).reduce((s, k) => s + Math.max(0, (after[k] || 0) - (before[k] || 0)), 0);
+        if (gained > 0) return dug >= count ? `ok, ${dug} dug` : `ok, ${dug} of ${count} dug (${lastReason || "stopped"})`;
+        return lastReason === "timeout" ? "timeout" : `${lastReason || "no item gained"}`;
+    }
+
+    // ---- bridging --------------------------------------------------------------
+    // Sneak and place filler blocks under the feet, one step at a time, across a
+    // gap or water in a compass direction. Stops at the first failed placement.
+    async bridge(direction) {
+        const bot = this.bot;
+        const { Vec3 } = require("vec3");
+        const dir = traversal.COMPASS[direction];
+        if (!dir) return `failed: unknown direction ${direction}`;
+        const inv = this.inventoryCounts();
+        const fillerName = Object.keys(inv).find((n) => PLACEABLE_RE.test(n));
+        if (!fillerName) return "failed: no filler blocks (cobblestone, dirt, planks) to place";
+        const def = this.mcData.itemsByName[fillerName];
+        const item = bot.inventory.items().find((it) => it.name === fillerName);
+        if (!item) return "failed: filler block not in the bag any more";
+        let placed = 0;
+        try {
+            await bot.equip(item, "hand");
+            bot.setControlState("sneak", true);
+            for (let i = 0; i < BRIDGE_MAX_BLOCKS; i++) {
+                if (!this.active) break;
+                const feet = bot.entity.position.floored();
+                const standing = bot.blockAt(feet.offset(0, -1, 0));
+                const ahead = bot.blockAt(feet.offset(dir.dx, -1, dir.dz));
+                if (!standing || standing.boundingBox !== "block") return placed ? `ok, ${placed} placed, lost footing` : "failed: nothing solid under the feet";
+                if (!ahead || ahead.boundingBox !== "block") {
+                    if (!bot.inventory.items().some((it) => it.name === fillerName)) break;
+                    await bot.lookAt(standing.position.offset(0.5 + dir.dx * 0.5, 0.5, 0.5 + dir.dz * 0.5), true);
+                    await withTimeout(bot.placeBlock(standing, new Vec3(dir.dx, 0, dir.dz)), 3000, "placeBlock");
+                    placed++;
+                }
+                // step forward onto the block just placed (or already there)
+                const target = feet.offset(dir.dx, 0, dir.dz);
+                bot.setControlState("forward", true);
+                await bot.lookAt(target.offset(0.5, 1.6, 0.5), true);
+                const t0 = Date.now();
+                while (Date.now() - t0 < 1500) {
+                    await sleep(50);
+                    const f = bot.entity.position.floored();
+                    if (f.x === target.x && f.z === target.z) break;
+                }
+                bot.setControlState("forward", false);
+                const next = bot.blockAt(bot.entity.position.floored().offset(dir.dx, -1, dir.dz));
+                const survey = traversal.surveyCandidate(bot, dir.dx, dir.dz, 4);
+                if (next && next.boundingBox === "block" && !survey.hazards.includes("water") && survey.elevationDelta !== "unknown") break; // solid ground ahead
+            }
+        } catch (err) {
+            return placed ? `ok, ${placed} placed, then ${err.message.split("\n")[0].slice(0, 50)}` : `failed: ${err.message.split("\n")[0].slice(0, 60)}`;
+        } finally {
+            bot.setControlState("forward", false);
+            bot.setControlState("sneak", false);
+        }
+        return placed ? `ok, ${placed} blocks placed ${direction}` : "ok, solid ground already, no block needed";
+    }
+
+    // ---- helpers for generated primitives ----------------------------------------
+    // The live entity nearest the bot whose name is in `names` (e.g. ["cow", "pig"]).
+    nearestEntity(names, maxDistance = 32) {
+        const here = this.bot.entity.position;
+        const set = new Set(Array.isArray(names) ? names : [names]);
+        let best = null;
+        let bestD = maxDistance;
+        for (const e of Object.values(this.bot.entities || {})) {
+            if (e === this.bot.entity || !e.position || !set.has(e.name)) continue;
+            const d = e.position.distanceTo(here);
+            if (d <= bestD) {
+                best = e;
+                bestD = d;
+            }
+        }
+        return best;
+    }
+
+    // An air block with solid ground under it within `radius` of `pos`, nearest first.
+    freeSpotNear(pos, radius = 2) {
+        const { Vec3 } = require("vec3");
+        const base = new Vec3(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z));
+        let best = null;
+        for (let dx = -radius; dx <= radius; dx++)
+            for (let dz = -radius; dz <= radius; dz++)
+                for (let dy = -1; dy <= 1; dy++) {
+                    if (!dx && !dz && !dy) continue;
+                    const p = base.offset(dx, dy, dz);
+                    const b = this.bot.blockAt(p);
+                    const below = this.bot.blockAt(p.offset(0, -1, 0));
+                    const above = this.bot.blockAt(p.offset(0, 1, 0));
+                    if (!b || !below || b.boundingBox !== "empty" || below.boundingBox !== "block") continue;
+                    if (above && above.boundingBox === "block") continue;
+                    const d = Math.abs(dx) + Math.abs(dz) + Math.abs(dy);
+                    if (!best || d < best.d) best = { p, d };
+                }
+        return best ? best.p : null;
+    }
+
     // Players are only visible inside render distance: entity may be missing.
     playerEntity(name) {
         const p = (this.bot.players || {})[name];
@@ -1504,6 +1899,13 @@ class FastLoop {
                 `Walk about ${WALK_DISTANCE} blocks ${name}: surface ${s.surfaceBlock}, ` +
                 `elevation ${s.elevationDelta}` +
                 (s.hazards.length ? `, hazards ${s.hazards.join("/")}` : "");
+            // a gap or water ahead and filler blocks in the bag: offer to bridge it
+            const filler = this.placeableCount();
+            if (filler >= 4 && (s.hazards.includes("water") || s.elevationDelta === "unknown")) {
+                menu[`bridge:${name}`] =
+                    `Bridge ${name} by sneaking and placing up to ${BRIDGE_MAX_BLOCKS} filler blocks under the feet ` +
+                    `(${filler} cobblestone/dirt/planks carried; ${s.hazards.includes("water") ? "water" : "a drop or gap"} that way)`;
+            }
         }
         const above = bot.blockAt(pos.offset(0, 2, 0));
         if (!above || above.name === "air" || above.name === "cave_air") {
@@ -1555,6 +1957,9 @@ class FastLoop {
             }
             // a station already carried or standing nearby is not worth crafting again
             if (LANDMARK_BLOCKS.includes(item) && (snap.inventory[item] || this.landmarkDistance(item) !== null && this.landmarkDistance(item) <= 32)) continue;
+            // a tool already held is crafted again only when a goal asks for it
+            const goalWants = (this.target && this.target.matches(item)) || (this.highTargets || []).some((t) => t.matches && t.matches(item));
+            if (HELD_ONCE_RE.test(item) && snap.inventory[item] && !goalWants) continue;
             if (recipes.length) craftable.push(item);
             if (craftable.length >= MAX_MENU_CRAFT) break;
         }
@@ -1691,6 +2096,16 @@ class FastLoop {
         }
         // Waiting twice in a row achieves nothing: take it off the menu so the
         // next pick has to be a move (the loop was seen idling in wait/nudge).
+        // runtime-registered actions (generated by the brain), each decides if it applies now
+        Object.assign(menu, this.registry.menuEntries(snap));
+        // actions that failed instantly or that Jev judged stuck on sit out a few decisions
+        for (const [id, left] of [...this.cooldowns]) {
+            if (left <= 0) {
+                this.cooldowns.delete(id);
+                continue;
+            }
+            if (Object.keys(menu).length > 1 && menu[id] && !SAFETY_ACTIONS.has(id)) delete menu[id];
+        }
         // no "wait": standing still never reaches a goal, and the menu always has moves
         return menu;
     }
@@ -1729,10 +2144,13 @@ class FastLoop {
                     secondsSinceProgress: Math.round((Date.now() - this.lastProgressAt) / 1000),
                     actionsSinceProgress: this.actionsSinceProgress,
                 };
+                const fold = this.foldMenu(menu);
                 const questions = {
                     action: traversal.choiceFn(
                         "A Minecraft bot works toward `goal.text` (`goal.context` explains it; " +
-                            "`goal.target` is the exact item count still needed, when known). " +
+                            "`goal.target`, when present, is the item to hold: `need` is the TOTAL the bot must hold, " +
+                            "`have` is what it holds now, so the step still needs `need - have` more even when the " +
+                            "text says a smaller number). " +
                             "`inventory` maps item names to counts, `nearbyResources` lists " +
                             "block types with counts and nearest distance, `nearbyEntities` lists " +
                             "mobs nearest first, `droppedItems` are item stacks lying on the ground, " +
@@ -1741,11 +2159,13 @@ class FastLoop {
                             "the last few actions with their outcomes (avoid repeating ones that " +
                             "failed or made no progress). `bot.timeOfDay` is 0-24000 and night " +
                             "starts near 13000. " +
-                            "Each option is one bounded primitive the code will execute next. " +
+                            "Each option is one bounded primitive the code will execute next; an " +
+                            "option that lists several targets (blocks to mine, directions to walk) " +
+                            "is a verb whose exact target is chosen by a separate question. " +
                             "Which option makes the most progress toward the goal right now " +
                             "while keeping the bot safe (eat when hungry, deal with hostiles, " +
                             "avoid lava and water)?",
-                        menu
+                        fold.verbs
                     ),
                     danger: traversal.noulFn(
                         "Is the bot in immediate physical danger that must be handled before " +
@@ -1759,12 +2179,31 @@ class FastLoop {
                             "not reach the goal?"
                     ),
                     subgoalValid: traversal.noulFn(
-                        "Given `inventory`, `nearbyResources` and `landmarks` as they are now, does " +
+                        "Given `inventory`, `nearbyResources`, `landmarks` and `goal.target` (need is the total " +
+                            "to hold, have is held now) as they are now, does " +
                             "`goal.text` still need doing? Answer no if it is already satisfied or " +
                             "has become pointless (for example the item it asks for is already in " +
                             "hand, or the block it asks to place is already placed nearby)."
                     ),
                 };
+                // Speculative parameter questions, answered in the same request: the
+                // exact target for each verb with several options, and the mine batch size.
+                for (const [verb, group] of Object.entries(fold.params)) {
+                    questions[`param_${verb}`] = traversal.choiceFn(
+                        `If the bot's next action is \`${verb}\`, which target is best for \`goal.text\` ` +
+                            "given `inventory`, `nearbyResources`, `nearbyEntities` and `recentActions`? " +
+                            "Each option is one concrete target with live facts.",
+                        group
+                    );
+                }
+                if (this.wantsCount(menu)) {
+                    questions.param_count = traversal.choiceFn(
+                        "If the bot's next action is `mine`, how many blocks should it take in one go " +
+                            "before deciding again? Prefer more when the goal needs many of them and the " +
+                            "area is safe; one when the situation may change (hostiles, low food, night).",
+                        { one: "mine 1 block", four: "mine up to 4 blocks", eight: "mine up to 8 blocks" }
+                    );
+                }
                 if (!snap.target) {
                     questions.goalReached = traversal.noulFn(
                         "Looking at `inventory`, `nearbyResources` (placed blocks such as a " +
@@ -1779,9 +2218,13 @@ class FastLoop {
                 const ms = Date.now() - started;
                 this.stats.decisions++;
                 this.stats.jevMs += ms;
-                const a = answers.action;
+                const a = this.composeAction(answers, fold, menu);
+                this.pendingCount = answers.param_count ? COUNT_BUCKETS[answers.param_count.choice] || 1 : null;
                 this.lastDecision = {
                     choice: a.choice,
+                    verb: a.verb,
+                    param: a.param,
+                    count: this.pendingCount,
                     confidence: a.confidence,
                     probabilities: a.probabilities,
                     danger: answers.danger.noul,
@@ -1806,6 +2249,8 @@ class FastLoop {
                     valid: answers.subgoalValid.noul,
                     goalReached: this.lastDecision.goalReached,
                     options: Object.keys(menu).length,
+                    verbs: Object.keys(fold.verbs).length,
+                    count: this.pendingCount,
                     goal: this.goal ? this.goal.text : null,
                     inMenu: Boolean(menu[a.choice]),
                 };
@@ -1820,9 +2265,23 @@ class FastLoop {
                     this.pushTrigger("hazard", { jevDanger: answers.danger.noul });
                 }
                 if (answers.stuck.noul >= 0.7 && this.recent.length >= 3) {
-                    this.pushTrigger("stuck", { jevStuck: answers.stuck.noul, recent: this.recent.map((r) => r.action) });
-                    this.recent.push({ action: "nudge", outcome: "Jev judged the bot stuck; jumped in place" });
-                    nudge(this.bot);
+                    this.stuckStreak++;
+                    this.pushTrigger("stuck", { jevStuck: answers.stuck.noul, recent: this.recent.map((r) => r.action), streak: this.stuckStreak });
+                    // "stuck" means "this is not working": take the repeated action off the
+                    // menu for a while, and after two verdicts in a row let the brain re-select
+                    const last = this.recent[this.recent.length - 1];
+                    const prev = this.recent[this.recent.length - 2];
+                    if (last && prev && last.action === prev.action && !SAFETY_ACTIONS.has(last.action)) {
+                        this.cooldowns.set(last.action, ACTION_COOLDOWN_DECISIONS);
+                    }
+                    if (this.stuckStreak >= 2 && !this.goalReached) {
+                        this.pushTrigger("no_progress", { seconds: Math.round((Date.now() - this.lastProgressAt) / 1000), actions: this.actionsSinceProgress, target: snap.target, stuck: true });
+                        this.lastProgressAt = Date.now();
+                        this.actionsSinceProgress = 0;
+                        this.stuckStreak = 0;
+                    }
+                } else {
+                    this.stuckStreak = 0;
                 }
                 if (answers.subgoalValid.noul <= 0.2 && this.goal.kind === "task" && !this.goalReached) {
                     // not a failure: the brain re-selects without recording a skill
@@ -1943,11 +2402,31 @@ class FastLoop {
                         }
                         bot.pathfinder.setGoal(null);
                     };
-                    const before = this.inventoryCounts();
-                    await withTimeout(this.prims.mineBlock(bot, arg, 1), MINE_TIMEOUT_MS, action);
-                    const after = this.inventoryCounts();
-                    const gained = Object.keys(after).some((k) => (after[k] || 0) > (before[k] || 0));
-                    return gained ? "ok" : "no item gained";
+                    const summary = this.targetSummary();
+                    const remaining = summary && this.target && this.target.matches(arg) ? Math.max(1, summary.need - summary.have) : MINE_BATCH_MAX;
+                    const count = Math.max(1, Math.min(this.pendingCount || 1, remaining, MINE_BATCH_MAX));
+                    this.pendingCount = null;
+                    return await this.mineBatch(arg, count);
+                }
+                case "bridge": {
+                    return await this.bridge(arg);
+                }
+                case "x": {
+                    const p = this.registry.get(arg);
+                    if (!p || p.retired) return `failed: no action named ${arg}`;
+                    this.abortCurrent = () => {
+                        try {
+                            bot.pathfinder.setGoal(null);
+                        } catch (e) {
+                            /* ignore */
+                        }
+                    };
+                    const result = await withTimeout(
+                        Promise.resolve(p.execute(bot, this, { snap: this.lastSnapshot, target: this.targetSummary(), goal: this.goal })),
+                        PRIMITIVE_TIMEOUT_MS,
+                        action
+                    );
+                    return typeof result === "string" && result ? result.slice(0, 120) : "failed: no outcome returned";
                 }
                 case "craft": {
                     const before = this.inventoryCounts();
@@ -2096,20 +2575,7 @@ class FastLoop {
                     return dropped > 0 ? `ok, handed ${dropped} ${t.item} to ${t.player}` : "failed: nothing dropped";
                 }
                 case "discard": {
-                    const junk = this.junkToDeposit(this.inventoryCounts());
-                    let tossed = 0;
-                    for (const [name, count] of Object.entries(junk)) {
-                        const def = this.mcData.itemsByName[name];
-                        if (!def) continue;
-                        try {
-                            await withTimeout(bot.toss(def.id, null, count), 4000, "toss");
-                            tossed++;
-                            await sleep(150);
-                        } catch (err) {
-                            /* next item */
-                        }
-                    }
-                    return tossed ? `ok, tossed ${tossed} kind(s) of junk, ${this.freeSlots()} slots free` : "failed: nothing tossed";
+                    return await this.discardJunk();
                 }
                 case "withdraw": {
                     const chest = this.chestsKnown().find((c) => Object.keys(c.items).some((n) => this.target && this.target.matches(n)));
@@ -2175,7 +2641,9 @@ class FastLoop {
                 nudge(this.bot);
                 this.positions = [];
             }
+            this.lastSnapshot = snap;
             const menu = this.buildMenu(snap);
+            this.lastMenuVerbs = [...new Set(Object.keys(menu).map((k) => (k.startsWith("x:") ? k : k.split(":")[0])))];
             const replayed = this.nextReplay(menu);
             const action = replayed || (await this.decide(snap, menu));
             if (!this.active || !this.goal || this.goal.id !== goalId) continue;
@@ -2194,7 +2662,19 @@ class FastLoop {
             const after = this.targetSummary();
             const gain = before && after ? after.gained - before.gained : 0;
             this.stats.actions++;
-            this.actionsSinceProgress = gain > 0 ? 0 : this.actionsSinceProgress + 1;
+            const ms = Date.now() - t0;
+            const instantFail = ms < INSTANT_FAIL_MS && gain <= 0 && !/^ok/.test(outcome);
+            // an instant failure costs two of the no-progress budget and a few decisions off the menu
+            this.actionsSinceProgress = gain > 0 ? 0 : this.actionsSinceProgress + (instantFail ? 2 : 1);
+            if (gain > 0) this.stuckStreak = 0;
+            for (const [id, left] of [...this.cooldowns]) this.cooldowns.set(id, left - 1);
+            if (instantFail && !SAFETY_ACTIONS.has(action)) this.cooldowns.set(action, ACTION_COOLDOWN_DECISIONS);
+            if (action.startsWith("x:")) {
+                const ok = /^ok/.test(outcome) || gain > 0; // progress counts even after a timeout
+                this.registry.recordOutcome(action.slice(2), ok);
+                this.primitiveOutcomes.push({ name: action.slice(2), outcome, gain, ms, ok, at: Date.now(), goal: this.goal ? this.goal.text : null });
+                if (this.primitiveOutcomes.length > 50) this.primitiveOutcomes.shift();
+            }
             await this.autoEquipArmor();
             this.recent.push({
                 action,
@@ -2231,6 +2711,9 @@ class FastLoop {
         return {
             running: this.active,
             botName: this.bot.username || null,
+            primitives: this.registry.summary(),
+            primitiveOutcomes: drain ? this.primitiveOutcomes.splice(0) : [...this.primitiveOutcomes],
+            menuVerbs: this.lastMenuVerbs || [],
             players: Object.keys(this.bot.players || {}).filter((n) => !this.isBotName(n)),
             chat,
             serverPaused: this.serverPaused,

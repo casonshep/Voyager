@@ -180,6 +180,16 @@ class VoyagerEnv(gym.Env):
             raise RuntimeError(f"fast/home failed: {res.status_code} {res.text[:200]}")
         return res.json()
 
+    def fast_primitive(self, name: str, source: str, remove: bool = False, repaired: bool = False) -> Dict[str, Any]:
+        """Register (or remove) a runtime action in the bot process; returns {ok, error?, primitives}."""
+        payload: Dict[str, Any] = {"name": name, "source": source, "repaired": repaired}
+        if remove:
+            payload = {"name": name, "remove": True}
+        res = requests.post(f"{self.server}/fast/primitive", json=payload, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"fast/primitive failed: {res.status_code} {res.text[:200]}")
+        return res.json()
+
     def fast_say(self, text: str) -> None:
         """Have the bot say a line in chat (a short acknowledgement to players)."""
         res = requests.post(f"{self.server}/fast/say", json={"text": text}, timeout=30)

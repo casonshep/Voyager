@@ -183,8 +183,8 @@ def test_high_goal_builds_skill_tree():
         assert info == {"task": "Craft a wooden pickaxe", "success": True, "interrupted": False}
         assert all(g["highGoal"]["text"] == "Craft a wooden pickaxe" for g in env.goals)
         assert env.goals[0]["text"] == "Obtain 3 oak_planks" and env.goals[0]["target"] == {"item": "oak_planks", "count": 3}
-        # after the stall the only derived candidate is excluded, so the high goal itself is the fallback
-        assert [g["text"] for g in env.goals[1:]] == ["Craft 1 wooden_pickaxe", "Craft a wooden pickaxe"]
+        # after the stall the only derived candidate is offered again; the high goal's bare name is never posted
+        assert [g["text"] for g in env.goals[1:]] == ["Craft 1 wooden_pickaxe", "Craft 1 wooden_pickaxe"]
         # the tree: high node connected to the sub nodes used
         high = brain.skills.node("Craft a wooden pickaxe", {"item": "wooden_pickaxe", "count": 1})
         assert high and high["kind"] == "high"
@@ -769,3 +769,188 @@ def test_interrupted_directive_is_requeued_behind_the_newer_one():
     # malformed numbers from the model fall back to defaults instead of aborting the directive
     steps = FastBrain._parse_steps('[{"text": "a", "target": {"item": "oak_log", "count": "lots"}}, {"text": "b", "target": {"nearPlayer": "cason", "distance": null}}]', "cason", [])
     assert steps[0]["target"] == {"item": "oak_log", "count": 1} and steps[1]["target"]["distance"] == 3
+
+
+def test_action_generator_static_checks_and_module_parsing():
+    from voyager.fast.generator import extract_module, static_check
+
+    good = "// name: swim_ashore\nfunction menu(snap, loop) { return snap.inWater ? 'swim' : null; }\n" \
+           "async function execute(bot, loop, ctx) { for (let i = 0; i < 2; i++) { await bot.lookAt(bot.entity.position); } return 'ok'; }"
+    assert static_check("swim_ashore", good) is None
+    assert "forbidden" in static_check("x1", good.replace("return 'ok'", "process.exit(); return 'ok'"))
+    assert "without await" in static_check("x1", good.replace("await bot.lookAt(bot.entity.position);", "i++;"))
+    assert "synchronous" in static_check("x1", good.replace("function menu", "async function menu"))
+    assert "name" in static_check("Bad-Name", good)
+    assert "missing" in static_check("x1", "async function execute() { return 'ok' }")
+    name, source = extract_module("Here you go:\n```javascript\n" + good + "\n```\nenjoy")
+    assert name == "swim_ashore" and source.startswith("// name: swim_ashore") and source.endswith("return 'ok'; }")
+    assert extract_module("no code at all")[0] is None
+
+
+def test_action_generator_posts_a_primitive_and_persists_it():
+    """A stall with Jev disabled and few verbs tried counts as a gap; GPT's module is checked, posted, saved."""
+    import time as _time
+    from voyager.fast.generator import ActionGenerator
+
+    module = "// name: hop_gap\nfunction menu(snap, loop) { return 'Hop the gap'; }\nasync function execute(bot, loop, ctx) { await bot.lookAt(bot.entity.position); return 'ok, hopped'; }"
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, messages):
+            self.calls += 1
+            return _Stub(content="```javascript\n" + module + "\n```")
+
+    class _Env(_StubEnv):
+        def __init__(self):
+            super().__init__()
+            self.primitives = []
+
+        def fast_primitive(self, name, source, remove=False):
+            self.primitives.append((name, source))
+            return {"ok": True, "primitives": [{"name": name, "trials": 0, "successes": 0, "failures": 0, "retired": False}]}
+
+    with tempfile.TemporaryDirectory() as d:
+        env = _Env()
+        v, recorded, logged = _voyager(env, d)
+        v.action_agent.llm = _LLM()
+        brain = FastBrain(v, poll_seconds=0.0, generate_actions=True)
+        gen = brain.generator
+        high = {"id": "high-1", "text": "Wood"}
+        sub = {"text": "Mine 8 oak_log"}
+        status = env._status(recentActions=[{"action": "mine:oak_log", "outcome": "timeout"}] * 3)
+        assert gen.on_stall(high, sub, status) is False  # first stall: not yet
+        assert gen.on_stall(high, sub, status) is True  # second stall: a gap, generation starts
+        for _ in range(100):
+            if not gen.busy:
+                break
+            _time.sleep(0.02)
+        assert env.primitives and env.primitives[0][0] == "hop_gap"
+        assert os.path.exists(os.path.join(d, "fast", "primitives", "hop_gap.js"))
+        assert any("x:hop_gap registered" in m for m in gen.drain())
+        assert any(g == "action_generated" for g, _ in logged)
+        # cooldown: the same subgoal does not trigger again right away
+        assert gen.on_stall(high, sub, status) is False
+        # a fresh brain on the same checkpoint re-registers the saved action
+        env2 = _Env()
+        v2, _, _ = _voyager(env2, d)
+        brain2 = FastBrain(v2, poll_seconds=0.0)
+        assert brain2.generator.reload() == 1 and env2.primitives[0][0] == "hop_gap"
+
+
+def test_action_generator_respects_live_cap_and_rejections():
+    from voyager.fast.generator import ActionGenerator
+
+    class _Env(_StubEnv):
+        def fast_primitive(self, name, source, remove=False):
+            return {"ok": False, "error": "compile error: oops"}
+
+    class _LLM:
+        def __call__(self, messages):
+            return _Stub(content="```js\nfunction menu(){ return 'x' }\nasync function execute(){ return 'ok' }\n```")
+
+    with tempfile.TemporaryDirectory() as d:
+        env = _Env()
+        v, recorded, logged = _voyager(env, d)
+        v.action_agent.llm = _LLM()
+        brain = FastBrain(v, poll_seconds=0.0)
+        gen = brain.generator
+        gen.stalls_before = 1
+        live = [{"name": f"p{i}", "retired": False} for i in range(8)]
+        assert gen.on_stall({"id": "h", "text": "Wood"}, {"text": "Mine 8 oak_log"}, env._status(primitives=live)) is False
+        assert any("live already" in m for m in gen.drain())
+        # a Node rejection is retried once with the error, then given up
+        assert gen.on_stall({"id": "h", "text": "Wood"}, {"text": "Obtain 2 stick"}, env._status()) is True
+        import time as _time
+        for _ in range(100):
+            if not gen.busy:
+                break
+            _time.sleep(0.02)
+        msgs = gen.drain()
+        assert sum("rejected" in m for m in msgs) == 2
+        assert any(g == "action_generation_failed" for g, _ in logged)
+
+
+def test_no_candidates_never_posts_the_high_goal_name():
+    """Every planner step in the failed set: offer one again; with no steps at all,
+    post the first unmet target; a target already failed means the goal is exhausted."""
+
+    class _Env(_StubEnv):
+        def __init__(self):
+            super().__init__()
+            self.cands = [{"text": "Craft 3 oak_planks", "target": {"item": "oak_planks", "count": 8}, "why": "chest"}]
+            self.checks = []
+
+        def fast_subgoals(self, text, target=None, check=None, targets=None, **kw):
+            if check is not None:
+                self.checks.append(check)
+                return {"satisfied": [False for _ in check]}
+            return {"target": {"item": "near:chest", "need": 1, "have": 0, "gained": 0}, "targets": [{"item": "near:chest", "need": 1}], "candidates": self.cands}
+
+    with tempfile.TemporaryDirectory() as d:
+        env = _Env()
+        v, recorded, logged = _voyager(env, d)
+        brain = FastBrain(v, poll_seconds=0.0)
+        high = {"id": "high-1", "text": "Home base", "targets": [{"nearBlock": "chest"}]}
+        status = env._status()
+        pick = brain._select_subgoal(high, "ctx", status, {"Craft 3 oak_planks"})
+        assert pick["text"] == "Craft 3 oak_planks"  # offered again rather than the bare goal name
+        env.cands = []
+        pick = brain._select_subgoal(high, "ctx", status, set())
+        assert pick["text"] == "Place the chest" and pick["target"] == {"nearBlock": "chest"}
+        pick = brain._select_subgoal(high, "ctx", status, {"Place the chest"})
+        assert pick.get("exhausted") is True
+        # run_high_goal ends at once on an exhausted selection instead of running the name to a timeout
+        brain._select_subgoal = lambda *a, **k: {"text": "Home base", "target": None, "why": "exhausted", "skill": None, "exhausted": True}
+        info = brain.run_high_goal("Home base", "ctx", targets=[{"nearBlock": "chest"}])
+        assert info["success"] is False and env.polls == 0
+        assert all(g["text"] != "Home base" for g in env.goals)
+
+
+def test_generated_action_outcomes_are_logged_and_repaired_once():
+    """A failed generated action is sent back to GPT once with its outcome; a repaired or
+    successful one is left alone; outcomes are logged for review."""
+    import time as _time
+
+    class _LLM:
+        def __init__(self):
+            self.prompts = []
+
+        def __call__(self, messages):
+            self.prompts.append(messages[-1].content)
+            return _Stub(content="```javascript\n// name: hop\nfunction menu(snap, loop) { return 'Hop'; }\nasync function execute(bot, loop, ctx) { await bot.toss(1, null, 1); return 'ok'; }\n```")
+
+    class _Env(_StubEnv):
+        def __init__(self):
+            super().__init__()
+            self.posted = []
+
+        def fast_primitive(self, name, source, remove=False, repaired=False):
+            self.posted.append((name, repaired))
+            return {"ok": True, "primitives": []}
+
+    with tempfile.TemporaryDirectory() as d:
+        env = _Env()
+        v, recorded, logged = _voyager(env, d)
+        v.action_agent.llm = _LLM()
+        brain = FastBrain(v, poll_seconds=0.0)
+        gen = brain.generator
+        gen.registered["hop"] = "function menu(){ return 'x' }\nasync function execute(bot){ bot.toss(1, null, 1, () => {}); return 'ok'; }"
+        prims = [{"name": "hop", "trials": 1, "successes": 0, "failures": 1, "retired": False, "repaired": False}]
+        gen.on_outcomes([{"name": "hop", "outcome": "timeout", "gain": 0, "ms": 20000, "ok": False, "goal": "Free up 4 inventory slots"}], env._status(primitives=prims))
+        for _ in range(100):
+            if not gen.busy:
+                break
+            _time.sleep(0.02)
+        assert env.posted == [("hop", True)]
+        assert "timeout" in v.action_agent.llm.prompts[0] and "callback" in v.action_agent.llm.prompts[0]
+        assert any(g == "action_outcome" for g, _ in logged) and any(g == "action_repaired" for g, _ in logged)
+        assert os.path.exists(os.path.join(d, "fast", "primitives", "hop.js"))
+        # already repaired: no second attempt; a success never triggers one
+        prims[0]["repaired"] = True
+        gen.on_outcomes([{"name": "hop", "outcome": "failed: x", "gain": 0, "ms": 10, "ok": False}], env._status(primitives=prims))
+        gen.on_outcomes([{"name": "hop", "outcome": "ok", "gain": 1, "ms": 10, "ok": True}], env._status(primitives=prims))
+        assert len(env.posted) == 1
+        tallies = gen._outcomes_by_action([{"action": "mine:oak_log", "outcome": "timeout"}, {"action": "mine:oak_log", "outcome": "timeout"}, {"action": "walk:north", "outcome": "ok"}])
+        assert tallies == {"mine:oak_log": {"timeout": 2}, "walk:north": {"ok": 1}}

@@ -23,6 +23,15 @@ const app = express();
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb", extended: false }));
 
+// A throw inside a packet handler or a timer callback would otherwise end the
+// process (the signed-chat crash did exactly that). Log it and keep the bot.
+process.on("uncaughtException", (err) => {
+    console.log("uncaughtException (bot kept alive):", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (err) => {
+    console.log("unhandledRejection (ignored):", err && err.stack ? err.stack : err);
+});
+
 app.post("/start", (req, res) => {
     if (bot) onDisconnect("Restarting bot");
     bot = null;
@@ -502,6 +511,29 @@ app.post("/fast/home", (req, res) => {
     const b = req.body || {};
     bot.fastLoop.setHome(b.x !== undefined ? b : null);
     res.json({ home: bot.fastLoop.home });
+});
+
+// Register (or replace) a runtime action; the brain generates these. Returns
+// the exact compile or check error so the generator can retry with it.
+app.post("/fast/primitive", (req, res) => {
+    if (!bot || !bot.fastLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
+    }
+    const b = req.body || {};
+    if (b.remove) {
+        res.json({ ok: bot.fastLoop.registry.remove(String(b.name || "")) });
+        return;
+    }
+    let snap = null;
+    try {
+        snap = bot.entity ? bot.fastLoop.snapshot() : null;
+    } catch (err) {
+        snap = null;
+    }
+    const result = bot.fastLoop.registry.register(String(b.name || ""), String(b.source || ""), snap);
+    if (result.ok && b.repaired) bot.fastLoop.registry.markRepaired(String(b.name));
+    res.json({ ...result, primitives: bot.fastLoop.registry.summary() });
 });
 
 app.post("/fast/say", (req, res) => {

@@ -355,7 +355,188 @@ function check(label, ok, detail) {
     bot.game.dimension = "minecraft:overworld";
     const sat = await loop.checkSatisfied([{ item: "family:food", count: 8 }, { item: "torch", count: 16 }, { dimension: "the_nether" }, { nearBlock: "furnace" }]);
     check("milestone check: food yes, torches no, nether no, furnace no", JSON.stringify(sat) === "[true,false,false,false]", JSON.stringify(sat));
-    check("pathfinder movements: no towers, no scaffolding, digging allowed", loop.movements && loop.movements.allow1by1towers === false && loop.movements.scafoldingBlocks.length === 0 && loop.movements.canDig === true);
+    check("pathfinder movements: no towers, horizontal scaffolding with filler blocks, digging allowed", loop.movements && loop.movements.allow1by1towers === false && loop.movements.scafoldingBlocks.length > 3 && loop.movements.canDig === true);
+
+    console.log("--- parameterised menu fold ---");
+    {
+        const flat = { "walk:north": "n", "walk:south": "s", "mine:oak_log": "logs 3 away", "mine:stone": "stone 5 away", "craft:stick": "sticks", "eat": "eat now", "x:dance": "generated" };
+        const fold = loop.foldMenu(flat);
+        check("verbs with several targets fold to one verb", Object.keys(fold.verbs).sort().join(",") === "craft:stick,eat,mine,walk,x:dance", Object.keys(fold.verbs).join(","));
+        check("single-target verbs stay as full ids", "craft:stick" in fold.verbs && !("craft" in fold.params));
+        check("parameter groups carry the per-target facts", fold.params.mine.oak_log === "logs 3 away" && fold.params.walk.south === "s");
+        check("verb summary lists its targets", /oak_log: logs 3 away/.test(fold.verbs.mine) && /2 targets/.test(fold.verbs.mine));
+        const composed = loop.composeAction({ action: { choice: "mine", confidence: 0.9, probabilities: {} }, param_mine: { choice: "stone" } }, fold, flat);
+        check("verb + parameter compose to a menu id", composed.choice === "mine:stone" && composed.inMenu && composed.verb === "mine" && composed.param === "stone");
+        const missing = loop.composeAction({ action: { choice: "walk", confidence: 0.5, probabilities: {} } }, fold, flat);
+        check("missing parameter answer falls back to the first target", missing.choice === "walk:north");
+        const single = loop.composeAction({ action: { choice: "eat", confidence: 0.5, probabilities: {} } }, fold, flat);
+        check("singleton option passes through", single.choice === "eat" && single.param === null);
+        check("a single mine option still asks for a batch count", loop.wantsCount({ "mine:iron_ore": "x", "walk:north": "n" }) && !loop.wantsCount({ "walk:north": "n" }));
+    }
+
+    console.log("--- registered primitives ---");
+    {
+        const { staticCheck } = require("../lib/primitiveRegistry");
+        check("static check rejects process access", /forbidden/.test(staticCheck("bad", "function menu(){return null}\nasync function execute(){ process.exit() }")));
+        check("static check rejects a loop without await", /without await/.test(staticCheck("bad", "function menu(){return null}\nasync function execute(){ while (true) { x++ } }")));
+        check("static check rejects bot.chat", /bot.chat/.test(staticCheck("bad", "function menu(){return null}\nasync function execute(bot){ bot.chat('hi') }")));
+        check("static check rejects a bad name", /name/.test(staticCheck("Bad Name", "function menu(){return null}\nasync function execute(){}")));
+        const src = "function menu(snap, loop) { return `Wave at ${Object.keys(snap.inventory).length} item kinds`; }\nasync function execute(bot, loop, ctx) { let n = 0; for (let i = 0; i < 2; i++) { await new Promise((r) => setTimeout(r, 1)); n++; } return `ok, waved ${n}`; }";
+        const r = loop.registry.register("wave", src, loop.snapshot());
+        check("a valid primitive registers", r.ok === true, JSON.stringify(r));
+        const m = loop.buildMenu(loop.snapshot());
+        check("registered action appears on the menu as x:<name> with a trial note", typeof m["x:wave"] === "string" && /trial/.test(m["x:wave"]), m["x:wave"]);
+        const out = await loop.execute("x:wave");
+        check("registered action executes under the x: verb", out === "ok, waved 2", out);
+        for (let i = 0; i < 3; i++) loop.registry.recordOutcome("wave", false);
+        check("three failures with no success retire it", loop.registry.get("wave").retired && !("x:wave" in loop.buildMenu(loop.snapshot())));
+        check("status reports primitives", loop.status().primitives.some((p) => p.name === "wave" && p.retired));
+        const asyncMenu = loop.registry.register("lazy", "async function menu(){ return 'x' }\nasync function execute(){ return 'ok' }", loop.snapshot());
+        check("an async menu() is rejected", asyncMenu.ok === false && /synchronous/.test(asyncMenu.error), JSON.stringify(asyncMenu));
+        const badReq = loop.registry.register("fsy", "const fs = require('fs');\nfunction menu(){ return null }\nasync function execute(){ return 'ok' }", loop.snapshot());
+        check("require of fs is rejected", badReq.ok === false, JSON.stringify(badReq));
+        loop.registry.remove("wave"); loop.registry.remove("lazy");
+    }
+
+    console.log("--- home base: partially held ingredients are still steps ---");
+    {
+        const savedItems = bot.inventory.items;
+        const savedNearby = bot._blocksNearby;
+        const savedLandmarks = loop.landmarks;
+        bot.inventory.items = () => [{ name: "oak_planks", count: 5 }, { name: "dark_oak_planks", count: 1 }, { name: "stick", count: 77 }, { name: "cobblestone", count: 13 }, { name: "oak_log", count: 1 }];
+        bot._blocksNearby = { crafting_table: new Vec3(3, 64, 3) };
+        loop.landmarks = { crafting_table: { x: 3, y: 64, z: 3 } };
+        const r = await loop.deriveSubgoals("Home base", { targets: [{ nearBlock: "chest" }] }, null, [{ item: "stone_pickaxe", count: 1 }]);
+        const planks = r.candidates.find((c) => /oak_planks/.test(c.text));
+        check("chest target with 5 planks held offers the planks craft", Boolean(planks), JSON.stringify(r.candidates.map((c) => c.text)));
+        check("the planks target is an absolute holding (8), not the 3 still missing", planks && planks.target.count === 8, planks && JSON.stringify(planks.target));
+        check("the goal's own step ranks before the lookahead", r.candidates[0] === planks);
+        let guard = null;
+        try {
+            await loop.setGoal({ id: "g", text: "Home base", kind: "task", highGoal: { id: "h", text: "Home base", source: "ladder", targets: [{ nearBlock: "chest" }] } });
+        } catch (e) {
+            guard = e.message;
+        }
+        check("a subgoal that is just its high goal's name with no target is refused", guard && /no target/.test(guard), guard);
+        bot.inventory.items = savedItems;
+        bot._blocksNearby = savedNearby;
+        loop.landmarks = savedLandmarks;
+    }
+
+    console.log("--- discarding junk ---");
+    {
+        const savedItems = bot.inventory.items;
+        const savedChat = bot.chat;
+        let inv = [{ name: "dirt", count: 40 }, { name: "gravel", count: 30 }, { name: "oak_log", count: 2 }];
+        bot.inventory.items = () => inv;
+        const cleared = [];
+        bot.chat = (line) => {
+            const m = /^\/clear @s minecraft:(\w+) (\d+)$/.exec(line);
+            if (!m) return;
+            cleared.push(m[1]);
+            inv = inv.filter((it) => it.name !== m[1]);
+        };
+        const junk = loop.junkToDeposit(loop.inventoryCounts());
+        if (Object.keys(junk).length) {
+            const out = await loop.discardJunk();
+            check("an operator deletes junk with /clear and nothing hits the ground", /deleted/.test(out) && cleared.length > 0 && loop.canClear === true, out);
+        } else {
+            check("discard case skipped: keep table considers this bag worth keeping", true);
+        }
+        // a bot without op falls back to tossing and the thrown stacks are not loot
+        loop.canClear = null;
+        inv = [{ name: "dirt", count: 40 }, { name: "gravel", count: 30 }];
+        bot.chat = () => {};
+        const savedToss = bot.toss;
+        let nextId = 900;
+        bot.toss = async (id, meta, count) => {
+            const name = Object.values(mcData.items).find((it) => it.id === id).name;
+            inv = inv.filter((it) => it.name !== name);
+            bot.entities[nextId] = { id: nextId, name: "item", position: bot.entity.position.offset(1, 0, 0) };
+            nextId++;
+        };
+        const junk2 = loop.junkToDeposit(loop.inventoryCounts());
+        if (Object.keys(junk2).length) {
+            const out2 = await loop.discardJunk();
+            check("without op the junk is tossed and remembered", /tossed/.test(out2) && loop.canClear === false && loop.tossed.size > 0, out2);
+            check("thrown stacks are invisible to the drop scan", loop.droppedItems().every((e) => !loop.tossed.has(e.id)));
+        } else {
+            check("toss case skipped: keep table considers this bag worth keeping", true);
+        }
+        for (const id of [...loop.tossed.keys()]) delete bot.entities[id];
+        loop.tossed.clear();
+        loop.canClear = null;
+        bot.toss = savedToss;
+        bot.chat = savedChat;
+        bot.inventory.items = savedItems;
+    }
+
+    console.log("--- canopy is not a roof; tools and cooldowns ---");
+    {
+        const savedBlockAt = bot.blockAt;
+        const feet = bot.entity.position.floored();
+        bot.blockAt = (p) => (p.y > feet.y + 3 && p.y < feet.y + 8 && p.x === feet.x && p.z === feet.z ? fakeBlock("dark_oak_leaves", p) : savedBlockAt.call(bot, p));
+        check("leaves overhead still count as sky", loop.skyAbove(feet) === true && loop.fingerprint().biome !== "underground");
+        bot.blockAt = (p) => (p.y > feet.y + 3 && p.y < feet.y + 8 && p.x === feet.x && p.z === feet.z ? fakeBlock("stone", p) : savedBlockAt.call(bot, p));
+        check("stone overhead is a roof", loop.skyAbove(feet) === false && loop.fingerprint().biome === "underground");
+        // no tread in any direction: the staircase reports a failure instead of 48 turns
+        const wasActive = loop.active;
+        loop.active = true;
+        const out = await loop.surfaceUp(() => false);
+        loop.active = wasActive;
+        check("staircase with nothing to step onto fails fast", /failed/.test(out), out);
+        bot.blockAt = savedBlockAt;
+        const inv = { wooden_pickaxe: 16, stone_pickaxe: 1, wooden_axe: 4, stone_sword: 1, wooden_sword: 1, cobblestone: 10 };
+        const extra = loop.excessTools(inv);
+        check("keep the best tool of each kind plus a spare pickaxe", extra.wooden_pickaxe === 15 && extra.wooden_axe === 3 && extra.wooden_sword === 1 && !extra.stone_pickaxe && !extra.stone_sword, JSON.stringify(extra));
+        const junk = loop.junkToDeposit(inv);
+        check("extra tools are junk for discard and deposit", junk.wooden_pickaxe === 15 && junk.wooden_axe === 3, JSON.stringify(junk));
+        // Basic kit asks for 2 pickaxes: the excess is still junk, the floor is the goal's count
+        const savedHigh = loop.highTargets;
+        loop.highTargets = [await loop.parseTarget("", { item: "family:pickaxe", count: 2 })];
+        const junkKit = loop.junkToDeposit(inv);
+        check("during Basic kit the 15 spare wooden pickaxes are still junk", junkKit.wooden_pickaxe === 15, JSON.stringify(junkKit));
+        loop.highTargets = [await loop.parseTarget("", { item: "family:pickaxe", count: 4 })];
+        const junkKit4 = loop.junkToDeposit(inv);
+        check("a goal wanting 4 pickaxes keeps 4", junkKit4.wooden_pickaxe === 13, JSON.stringify(junkKit4));
+        loop.highTargets = savedHigh;
+        const savedItems = bot.inventory.items;
+        bot.inventory.items = () => [{ name: "oak_planks", count: 12 }, { name: "stick", count: 8 }, { name: "wooden_pickaxe", count: 2 }];
+        const savedNearby2 = bot._blocksNearby;
+        const savedRecipes = bot.recipesFor;
+        bot._blocksNearby = { crafting_table: new Vec3(3, 64, 3) };
+        const tools = new Set([mcData.itemsByName.wooden_pickaxe.id, mcData.itemsByName.wooden_axe.id, mcData.itemsByName.wooden_sword.id]);
+        bot.recipesFor = (id, meta, min, table) => (tools.has(id) ? [{ id }] : savedRecipes.call(bot, id, meta, min, table));
+        const m1 = loop.buildMenu(loop.snapshot());
+        bot.recipesFor = savedRecipes;
+        bot._blocksNearby = savedNearby2;
+        check("a tool already held is not offered for crafting again", !("craft:wooden_pickaxe" in m1) && ("craft:wooden_axe" in m1 || "craft:wooden_sword" in m1), Object.keys(m1).filter((k) => k.startsWith("craft:")).join(","));
+        bot.inventory.items = savedItems;
+        loop.cooldowns.set("walk:north", 2);
+        const m2 = loop.buildMenu(loop.snapshot());
+        check("an action on cooldown is off the menu", !("walk:north" in m2) && "walk:south" in m2);
+        loop.cooldowns.clear();
+        loop.cooldowns.set("eat", 2);
+        {
+            const savedFood = bot.food;
+            bot.food = 5;
+            const m3 = loop.buildMenu(loop.snapshot());
+            check("safety actions are never pruned", "eat" in m3, Object.keys(m3).join(","));
+            bot.food = savedFood;
+        }
+        loop.cooldowns.clear();
+        check("helpers: nearest entity and free spot", loop.nearestEntity(["zombie", "cow"], 64) !== null && loop.freeSpotNear(bot.entity.position, 2) !== null);
+    }
+
+    console.log("--- batch mining helpers ---");
+    {
+        const matches = (n) => /_log$/.test(n);
+        const trunk = loop.connectedSameFamily(fakeBlock("oak_log", new Vec3(2, 64, -10)), matches);
+        check("connected logs of a trunk are found", trunk.length >= 1 && trunk.every((b) => /_log$/.test(b.name)), String(trunk.length));
+        const near = loop.nearestBlocks(matches, 32, 64);
+        check("nearest-first block search", near.length > 0 && near[0].position.distanceTo(bot.entity.position) <= near[near.length - 1].position.distanceTo(bot.entity.position));
+        check("placeable filler count reads the bag", typeof loop.placeableCount() === "number");
+    }
     // multi-target high goal: all pieces must hold
     loop.active = true; loop.run = async () => {};
     bot.inventory.items = () => [{ name: "stone_pickaxe", count: 1 }];

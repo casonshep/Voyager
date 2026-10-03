@@ -43,6 +43,7 @@ import voyager.utils as U
 from voyager.typesafe import build_state, critic_shadow
 from voyager.utils import timing
 
+from .generator import ActionGenerator
 from .milestones import Ladder, target_label
 from .skills import SkillMemory, target_key
 
@@ -89,6 +90,7 @@ class FastBrain:
         max_proposal_rejections: int = 3,
         use_curriculum: bool = False,
         milestone_skip_subgoals: int = 6,
+        generate_actions: bool = True,
     ):
         # Goals come from the milestone ladder (voyager/fast/milestones.py); the
         # GPT curriculum is only used when use_curriculum=True or the ladder is done.
@@ -127,6 +129,8 @@ class FastBrain:
         self._decision_stats: list[tuple[float | None, int]] = []
         self._deferred: dict[str, float] = {}  # subgoal text -> time it may be offered again (batch cooking)
         self.directives: list[dict[str, Any]] = []  # player commands waiting to run, oldest first
+        # Fills action gaps with GPT-written primitives the bot process registers (voyager/fast/generator.py)
+        self.generator = ActionGenerator(self, enabled=generate_actions)
         self._interrupt: dict[str, Any] | None = None  # set by chat handling to end the current high goal
         self.chat_interrupt_threshold = 0.45
         self._home_path = f"{voyager.ckpt_dir}/fast/home.json"
@@ -147,6 +151,10 @@ class FastBrain:
                 self.env.fast_home(self.home)
             except Exception as exc:
                 print(f"\033[31mFast brain: could not send home base: {exc}\033[0m")
+        try:
+            self.generator.reload()
+        except Exception as exc:
+            print(f"\033[31mFast brain: could not reload generated actions: {exc}\033[0m")
         # keep the bot busy from the first second; the status poll seeds the curriculum
         self.env.fast_goal(STANDING_GOAL)
         self.last_status = self.env.fast_status()
@@ -426,6 +434,10 @@ class FastBrain:
 
         paused_since: float | None = None
         while True:
+            if subgoal.get("exhausted"):
+                print(f"\033[41mFast brain: no step left for '{task}'; failing it now\033[0m")
+                subgoal_failures = self.subgoal_failures_before_fail
+                break
             time.sleep(self.poll_seconds)
             status = self.env.fast_status()
             self.last_status = status
@@ -433,6 +445,12 @@ class FastBrain:
             self._remember_chests(events)
             self._learn_from_chat(high, status.get("events") or [])
             self._print_decisions(status.get("decisions") or [])
+            try:
+                self.generator.on_outcomes(status.get("primitiveOutcomes") or [], status)
+            except Exception as exc:
+                print(f"\033[31mFast brain: action outcome handling error: {exc}\033[0m")
+            for line in self.generator.drain():
+                print(f"\033[36mFast brain: {line}\033[0m")
             self._handle_player_chat(status.get("chat") or [], high, subgoal, status)
             if status.get("highTarget") and high_target is None:
                 high_target = {"item": status["highTarget"]["item"], "count": status["highTarget"]["need"]}
@@ -497,6 +515,10 @@ class FastBrain:
                         f"\033[33mFast brain: subgoal '{subgoal['text']}' stalled "
                         f"({subgoal_failures}/{self.subgoal_failures_before_fail})\033[0m"
                     )
+                    try:
+                        self.generator.on_stall(high, subgoal, status, status.get("menuVerbs"))
+                    except Exception as exc:
+                        print(f"\033[31mFast brain: action generator error: {exc}\033[0m")
                     if subgoal_failures >= self.subgoal_failures_before_fail:
                         break
                     subgoal = self._select_subgoal(high, context, status, failed_subgoals)
@@ -754,11 +776,44 @@ class FastBrain:
                 node = None  # a skill that keeps failing is no recommendation
             candidates.append({"text": c["text"], "target": c.get("target"), "why": c.get("why", ""), "skill": node})
         if not candidates:
-            return {"text": high["text"], "target": None, "why": "nothing derived", "skill": None}
+            return self._fallback_subgoal(high, derived, failed)
         if len(candidates) == 1:
             return candidates[0]
         pick = self._jev_pick(high, context, status, candidates)
         return pick or candidates[0]
+
+    def _fallback_subgoal(self, high, derived, failed: set[str]) -> dict[str, Any]:
+        """No candidate survived the failed set. Never post the high goal's bare name
+        for a goal that has targets: Jev reads "Home base" as "be at home" and walks
+        in circles. Offer a failed candidate again, then the first unmet target itself,
+        and otherwise declare the goal exhausted so it fails now, not at the timeout."""
+        cands = derived.get("candidates") or []
+        retry = [c for c in cands if c["text"] != high["text"]]
+        if retry:
+            c = retry[0]
+            print(f"\033[33mFast brain: every step was tried; offering '{c['text']}' again\033[0m")
+            return {"text": c["text"], "target": c.get("target"), "why": "tried before; nothing else left", "skill": None}
+        targets = high.get("targets") or []
+        if not targets:
+            return {"text": high["text"], "target": None, "why": "nothing derived", "skill": None}
+        try:
+            sat = self.env.fast_subgoals(high["text"], check=targets).get("satisfied") or []
+        except Exception:
+            sat = []
+        for i, t in enumerate(targets):
+            if i < len(sat) and sat[i]:
+                continue
+            if t.get("nearBlock"):
+                text = f"Place the {str(t['nearBlock']).replace('_', ' ')}"
+            elif t.get("item"):
+                text = f"Obtain {t.get('count', 1)} {t['item']}"
+            else:
+                continue
+            if text in failed:
+                continue
+            print(f"\033[33mFast brain: no plan for '{high['text']}'; posting its unmet target '{text}'\033[0m")
+            return {"text": text, "target": t, "why": "the goal's own unmet target", "skill": None}
+        return {"text": high["text"], "target": None, "why": "exhausted", "skill": None, "exhausted": True}
 
     # ------------------------------------------------------------------ #
     # player directives: one LLM decomposition into verifiable steps, run in order
@@ -1075,6 +1130,8 @@ class FastBrain:
         return candidates[idx]
 
     def _start_subgoal(self, high, context, subgoal, status) -> dict[str, Any]:
+        if subgoal.get("exhausted"):
+            return {"goal": {"id": None, "text": subgoal["text"]}, "started": time.time(), "fingerprint": None, "inventory_before": {}}
         goal = {
             "id": f"{high['id']}-sub-{int(time.time() * 1000) % 100000000}",
             "text": subgoal["text"],
@@ -1149,6 +1206,8 @@ class FastBrain:
         for d in decisions:
             since = f"+{d['sinceLast']:.1f}s" if d.get("sinceLast") is not None else "first"
             flags = []
+            if d.get("count"):
+                flags.append(f"x{d['count']}")
             if d.get("danger", 0) >= 0.7:
                 flags.append("DANGER")
             if d.get("stuck", 0) >= 0.7:

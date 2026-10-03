@@ -390,27 +390,28 @@ class Planner {
             const inChest = this.chestSupply(n.item, n.matches);
             if (inChest > 0) {
                 const take = Math.min(inChest, n.remaining || 1);
-                return { text: `Take ${take} ${n.item} from the chest`, target: { item: n.item, count: take }, why: `${why}; a known chest holds ${inChest}` };
+                return { text: `Take ${take} ${n.item} from the chest`, target: { item: n.item, count: (n.have || 0) + take }, why: `${why}; a known chest holds ${inChest}` };
             }
         }
         switch (n.kind) {
             case "space":
                 return { text: `Free up ${MIN_FREE_SLOTS} inventory slots`, target: { freeSlots: MIN_FREE_SLOTS }, why: `${why}; the bag is nearly full (deposit into a chest or throw junk away)` };
             case "craft":
-                return { text: `Craft ${n.remaining} ${n.item}`, target: { item: n.item, count: n.remaining }, why };
+                // target counts are absolute holdings: have + what this step adds
+                return { text: `Craft ${n.remaining} ${n.item}`, target: { item: n.item, count: (n.have || 0) + n.remaining }, why };
             case "smelt": {
                 // a batch already cooking covers this: collect it when ready rather than loading more
                 const pending = this.loop.pendingOutput ? this.loop.pendingOutput((x) => x === n.item || (n.matches && n.matches(x))) : 0;
                 if (pending > 0) {
                     const jobs = this.loop.jobsFor((x) => x === n.item);
                     const left = Math.max(0, ...jobs.map((j) => Math.round((j.readyAt - Date.now()) / 1000)));
-                    return { text: `Collect ${Math.min(pending, n.remaining)} ${n.item} from the furnace`, target: { item: n.item, count: Math.min(pending, n.remaining) }, why: `${why}; ${pending} cooking, ready in about ${left}s`, cooking: left };
+                    return { text: `Collect ${Math.min(pending, n.remaining)} ${n.item} from the furnace`, target: { item: n.item, count: (n.have || 0) + Math.min(pending, n.remaining) }, why: `${why}; ${pending} cooking, ready in about ${left}s`, cooking: left };
                 }
                 const batch = Math.min(n.remaining, FURNACE_MAX_BATCH_PLAN);
-                return { text: `Smelt ${batch} ${n.rawInput}`, target: { item: n.item, count: batch }, why };
+                return { text: `Smelt ${batch} ${n.rawInput}`, target: { item: n.item, count: (n.have || 0) + batch }, why };
             }
             case "mine":
-                return { text: `Mine ${chunk} ${n.item}`, target: { item: n.item, count: chunk }, why };
+                return { text: `Mine ${chunk} ${n.item}`, target: { item: n.item, count: (n.have || 0) + chunk }, why };
             case "explore": {
                 // a surface resource wanted from underground: go up, do not wander the caves
                 const underground = this.loop.fingerprint().biome === "underground";
@@ -431,7 +432,7 @@ class Planner {
             }
             case "hunt":
                 if (n.item === "family:food" || n.item === "family:cooked_food") {
-                    return { text: `Hunt animals (${n.mob}) for ${chunk} food`, target: { item: n.item, count: chunk }, why: `${why}; animals live on the surface in daylight` };
+                    return { text: `Hunt animals (${n.mob}) for ${chunk} food`, target: { item: n.item, count: (n.have || 0) + chunk }, why: `${why}; animals live on the surface in daylight` };
                 }
                 return { text: `Kill a ${n.mob} for ${chunk} ${n.item}`, target: { item: n.item, count: chunk }, why };
             case "fuel":
@@ -440,7 +441,7 @@ class Planner {
             case "obtain":
             case "judged":
             default:
-                return { text: `Obtain ${chunk} ${n.item}`, target: { item: n.item, count: chunk }, why };
+                return { text: `Obtain ${chunk} ${n.item}`, target: { item: n.item, count: (n.have || 0) + chunk }, why };
         }
     }
 

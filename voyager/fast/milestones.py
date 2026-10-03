@@ -54,7 +54,8 @@ LADDER: list[Milestone] = [
     ),
     Milestone(
         "home", "Home base",
-        "A crafting table, a furnace and a chest together on the surface: the place to craft, smelt, store junk and restock.",
+        "Build the home base: place a crafting table, a furnace and a chest next to each other on the surface. "
+        "Craft whichever is missing first (a chest needs 8 planks, a furnace 8 cobblestone).",
         [{"nearBlock": "crafting_table"}, {"nearBlock": "furnace"}, {"nearBlock": "chest"}],
         notes="Place the three blocks next to each other; this spot becomes 'home' and return:home leads back to it.",
     ),
@@ -98,12 +99,6 @@ LADDER: list[Milestone] = [
             {"item": "iron_leggings", "count": 1}, {"item": "iron_boots", "count": 1},
         ],
         notes="Wear each piece once crafted (equip options appear in the action menu).",
-    ),
-    Milestone(
-        "food_supply", "Food supply",
-        "A stock of cooked food for long trips.",
-        [{"item": "family:cooked_food", "count": 16}],
-        recurring=True,
     ),
     Milestone(
         "diamonds", "Diamonds",
