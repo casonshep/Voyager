@@ -160,7 +160,9 @@ def test_post_order_completes_three_nodes_and_persists():
     assert result["status"] == "done" and result["nodes_done"] == 3
     assert [p["id"] for p in bridge.posted] == ["oak_log", "planks", "pickaxe"]
     post = bridge.posted[0]
-    assert set(post) == {"id", "description", "verify", "allowed_blocks", "budget_actions", "kind", "work", "requires", "tree_items"}
+    assert set(post) == {"id", "description", "verify", "allowed_blocks", "budget_actions", "kind", "work", "requires", "tree_items",
+                         "goal_id", "decision_log"}
+    assert post["goal_id"] == tree.goal_id and post["decision_log"].endswith("decisions.jsonl")
     assert "lava" in post["allowed_blocks"] and post["budget_actions"] == 20
     assert tree.nodes["oak_log"].done and tree.nodes["oak_log"].actions_spent == 5
     assert tree.nodes["oak_log"].trace[1]["action"] == "x:mine_cursor"
@@ -372,3 +374,141 @@ def test_builder_refusal_is_logged_with_its_reason():
     assert trav.run()["status"] == "done"
     refused = [e for e in trav.events if e.get("type") == "build_refused"]
     assert refused and "live already" in refused[0]["why"] and refused[0]["node"] == "oak_log"
+
+
+def test_forced_builds_that_produce_nothing_are_capped_then_redecompose():
+    # F3: a craft node with its inputs in hand used to cycle exhaust -> forced build(None)
+    # -> re-post with a halved budget every few seconds. Now: full budget after a forced
+    # build, and two empty forced builds in a row hand over to re-decomposition.
+    class EmptyBuilder(FakeBuilder):
+        last_refusal = None
+
+        def build(self, subtask, status, tree_items, reason="", force=False):
+            self.calls.append((subtask["id"], reason, force))
+            self.last_refusal = "GPT call failed: timeout"
+            return None
+
+    tree = pickaxe_tree()
+    tree.nodes["oak_log"].done = True
+    tree.nodes["planks"].requires = {"oak_log": 1}
+    redecomposed = []
+    exhausted = lambda: status([{"type": "budget_exhausted", "subtask_id": "planks", "actions_spent": 20}], "planks")
+    in_hand = lambda s: {**s, "snap": {**s["snap"], "inventory": {"oak_log": 3}}}
+    bridge = FakeBridge([in_hand(exhausted()) for _ in range(6)])
+    builder = EmptyBuilder()
+    trav, _ = make(tree, bridge, builder, redecompose=lambda t, n: redecomposed.append(n) or None)
+    result = trav.run()
+    forced = [c for c in builder.calls if c[2]]
+    assert len(forced) == 2, builder.calls
+    assert redecomposed == ["planks"] and result["status"] == "failed"
+    assert all(p["budget_actions"] == 20 for p in bridge.posted), [p["budget_actions"] for p in bridge.posted]
+    refused = [e for e in trav.events if e["type"] == "build_refused"]
+    assert refused and "timeout" in refused[0]["why"]
+    assert any(e["type"] == "forced_builds_exhausted" for e in trav.events)
+
+
+def test_retries_exhausted_reposts_with_the_full_budget():
+    tree = pickaxe_tree()
+    stuck = lambda: status([{"type": "stuck", "subtask_id": "oak_log", "kind": "position"}], "oak_log", completable=0.9)
+    bridge = FakeBridge([stuck(), stuck(), stuck(), stuck(),
+                         status([{"type": "subtask_done", "subtask_id": "oak_log", "trace": []}], "oak_log"),
+                         status([{"type": "subtask_done", "subtask_id": "planks", "trace": []}], "planks"),
+                         status([{"type": "subtask_done", "subtask_id": "pickaxe", "trace": []}], "pickaxe")])
+    trav, _ = make(tree, bridge, max_retries_per_node=3, exhaustions_before_redecompose=5)
+    assert trav.run()["status"] == "done"
+    budgets = [p["budget_actions"] for p in bridge.posted if p["id"] == "oak_log"]
+    assert budgets == [20, 10, 5, 5, 20], budgets
+
+
+
+def test_async_builds_keep_polling_and_hold_one_slot():
+    import threading
+    import time as _time
+
+    class SlowBuilder(FakeBuilder):
+        last_refusal = None
+
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def build(self, subtask, status, tree_items, reason="", force=False):
+            self.calls.append((subtask["id"], reason))
+            self.release.wait(timeout=5)  # a slow GPT conversation
+            return "x_slow"
+
+    tree = pickaxe_tree()
+    builder = SlowBuilder()
+    want = lambda: status([{"type": "builder_wanted", "subtask_id": "oak_log", "completable": 0.1, "menu": []}], "oak_log", completable=0.1)
+    polls = []
+
+    class CountingBridge(FakeBridge):
+        def agent_status(self):
+            polls.append(1)
+            if len(polls) == 4:
+                builder.release.set()  # the build finishes while the loop is still polling
+                _time.sleep(0.05)
+            return super().agent_status()
+
+    bridge = CountingBridge([want(), want(), want(), status(subtask_id="oak_log"),
+                             status([{"type": "subtask_done", "subtask_id": "oak_log", "trace": []}], "oak_log"),
+                             status([{"type": "subtask_done", "subtask_id": "planks", "trace": []}], "planks"),
+                             status([{"type": "subtask_done", "subtask_id": "pickaxe", "trace": []}], "pickaxe")])
+    trav, _ = make(tree, bridge, builder, async_builds=True)
+    assert trav.run()["status"] == "done"
+    assert len(builder.calls) == 1  # one slot: the two later requests were skipped, not queued
+    kinds = [e["type"] for e in trav.events]
+    assert kinds.count("build_skipped") == 2 and "build_started" in kinds
+    assert any(e["type"] == "build" and e.get("name") == "x_slow" for e in trav.events)
+    assert len(polls) == 7  # polling never stopped for the build
+
+
+
+def test_node_is_not_failed_while_its_build_runs_or_its_new_action_is_untested():
+    # 2026-10-13: both repaired actions registered seconds after their node had failed.
+    import threading
+
+    class SlowBuilder(FakeBuilder):
+        last_refusal = None
+
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+            self.untested = []
+
+        def build(self, subtask, status, tree_items, reason="", force=False):
+            self.calls.append((subtask["id"], reason))
+            self.release.wait(timeout=5)
+            self.untested = ["fresh_miner"]  # registered, not yet tried
+            return "fresh_miner"
+
+        def untested_for(self, subtask_id, status):
+            return list(self.untested)
+
+    tree = pickaxe_tree()
+    builder = SlowBuilder()
+    exhausted = lambda: status([{"type": "budget_exhausted", "subtask_id": "oak_log", "actions_spent": 20}], "oak_log")
+    want = status([{"type": "builder_wanted", "subtask_id": "oak_log", "completable": 0.1, "none": 0.8, "reason": "none_of_these", "menu": []}], "oak_log")
+    calls = {"n": 0}
+
+    class Bridge(FakeBridge):
+        def agent_status(self):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                builder.release.set()  # the build finishes while traversal waits on it
+            return super().agent_status()
+
+    redecomposed = []
+    bridge = Bridge([want, exhausted(), exhausted(),  # 2nd exhaustion: build running -> wait, grace
+                     status(subtask_id="oak_log"),     # fresh status read after the build
+                     exhausted(),                      # untested action -> second grace round
+                     exhausted(), exhausted()])        # grace used up -> re-decompose (fails here)
+    trav, _ = make(tree, bridge, builder, async_builds=True, redecompose=lambda t, n: redecomposed.append(n) or None)
+    result = trav.run()
+    kinds = [e["type"] for e in trav.events]
+    assert "waiting_for_build" in kinds and kinds.count("grace_round") == 2, kinds
+    assert any(e["type"] == "build" and e.get("name") == "fresh_miner" for e in trav.events)
+    assert kinds.index("build") < kinds.index("node_failed")  # the action existed before the node was given up
+    assert redecomposed == ["oak_log"] and result["status"] == "failed"
+    assert "no action on the menu can move the subtask forward" in builder.calls[0][1]
+    assert all(p["budget_actions"] == 20 for p in bridge.posted)

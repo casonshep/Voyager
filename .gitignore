@@ -138,3 +138,4 @@ upgrade-movement/
 # goal-tree agent: per-machine learned actions and generated reports
 skill_library/tree/
 reports/
+!.claude/research/

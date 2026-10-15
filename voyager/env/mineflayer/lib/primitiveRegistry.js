@@ -140,7 +140,10 @@ class PrimitiveRegistry {
 
     // Compile and register; returns {ok, error}. A snapshot (optional) lets the
     // menu function run once so an immediate throw is reported, not hidden.
-    register(name, source, snap, purpose = null) {
+    // `opts.repair`: this source is a repaired version of an action already registered
+    // under `name`: its trial counts start fresh and it comes back on the menu.
+    // `opts.version`: the version number the builder assigned (kept for the summary).
+    register(name, source, snap, purpose = null, opts = {}) {
         const err = staticCheck(name, source);
         if (err) return { ok: false, error: err };
         let mod;
@@ -189,17 +192,21 @@ class PrimitiveRegistry {
             }
         }
         const prev = this.items.get(name);
+        const fresh = !prev || Boolean(opts.repair);
         this.items.set(name, {
             name,
             source,
             menu: mod.menu,
             execute: mod.execute,
             observe: mod.observe,
-            trials: prev ? prev.trials : 0,
-            successes: prev ? prev.successes : 0,
-            failures: prev ? prev.failures : 0,
+            trials: fresh ? 0 : prev.trials,
+            successes: fresh ? 0 : prev.successes,
+            failures: fresh ? 0 : prev.failures,
+            outcomeLog: fresh ? [] : prev.outcomeLog || [],
+            lastOutcomes: fresh ? [] : prev.lastOutcomes || [],
             retired: false,
-            repaired: prev ? prev.repaired : false,
+            repaired: Boolean(opts.repair) || (prev ? prev.repaired : false),
+            version: Number(opts.version) > 0 ? Number(opts.version) : prev ? prev.version || 1 : 1,
             registeredAt: Date.now(),
             learnedFor: purpose || (prev ? prev.learnedFor : null), // the subtask it was built for
             purpose: declared ? declared.description : null, // what the action says it is for
@@ -207,7 +214,16 @@ class PrimitiveRegistry {
             menuBuilds: 0, // snapshots since registration
             offered: 0, // snapshots where menu() returned a line
         });
-        console.log(`primitives: registered x:${name}${prev ? " (replaced)" : ""}`);
+        if (opts.repair && Array.isArray(this.loop.recent)) {
+            // the failures in `recent` belong to the previous version: say so, so neither
+            // Jev nor its effect questions hold them against the repaired one
+            for (const r of this.loop.recent) {
+                if (r.action === `x:${name}` && !/\(earlier version; repaired since\)/.test(r.outcome || "")) {
+                    r.outcome = `${r.outcome} (earlier version; repaired since)`;
+                }
+            }
+        }
+        console.log(`primitives: registered x:${name}${opts.repair ? ` (repaired, v${this.items.get(name).version})` : prev ? " (replaced)" : ""}`);
         return { ok: true };
     }
 
@@ -257,7 +273,11 @@ class PrimitiveRegistry {
             p.menuBuilds++;
             if (typeof d === "string" && d.trim()) {
                 p.offered++;
-                const trial = this.isTrial(p) ? ` [new action, untested${p.trials ? `, ${p.trials} failed trial(s)` : ""}]` : "";
+                const trial = this.isTrial(p)
+                    ? p.repaired && p.trials === 0
+                        ? " [repaired since its last failure; this version is untested]"
+                        : ` [new action, untested${p.trials ? `, ${p.trials} failed trial(s)` : ""}]`
+                    : "";
                 let purpose = "";
                 if (p.purpose) purpose = ` [purpose: ${p.purpose}]`;
                 else if (p.learnedFor) purpose = ` [learned for: ${p.learnedFor}]`;
@@ -282,12 +302,17 @@ class PrimitiveRegistry {
         return out;
     }
 
-    recordOutcome(name, ok, outcome) {
+    // `meta` = {id, label}: the decision-record id and the typed outcome label
+    recordOutcome(name, ok, outcome, meta = {}) {
         const p = this.items.get(name);
         if (!p) return;
         p.trials++;
+        const text = String(outcome || (ok ? "ok" : "failed"));
         // the last few outcome texts go back to the builder so a rebuild can see WHY it failed
-        p.lastOutcomes = [...(p.lastOutcomes || []), String(outcome || (ok ? "ok" : "failed")).slice(0, 160)].slice(-3);
+        p.lastOutcomes = [...(p.lastOutcomes || []), text.slice(0, 160)].slice(-3);
+        // ...and the full evidence for a repair: every outcome of this version with its
+        // decision-record id and failure label (capped)
+        p.outcomeLog = [...(p.outcomeLog || []), { id: meta.id || null, ok: Boolean(ok), label: meta.label || null, outcome: text.slice(0, 300) }].slice(-12);
         if (ok) p.successes++;
         else p.failures++;
         if (!p.retired && p.successes === 0 && p.failures >= RETIRE_AFTER_FAILURES) {
@@ -308,6 +333,8 @@ class PrimitiveRegistry {
             successes: p.successes,
             failures: p.failures,
             retired: p.retired,
+            version: p.version || 1,
+            outcome_log: p.outcomeLog || [],
             trial: this.isTrial(p),
             stale: this.isStale(p),
             offered: p.offered,

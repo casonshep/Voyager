@@ -405,3 +405,14 @@ def test_vacuous_final_check_is_rejected_and_final_step_is_not_premarked():
     assert root.kind == "eat" and root.verify == {"status_at_least": {"field": "food", "min": 20}}
     assert "ALREADY TRUE now" in llm.calls[1][-1]["content"]
     assert not root.done and not any(n.done for n in tree.nodes.values())
+
+
+def test_final_work_step_without_items_gets_its_item_subtree():
+    # F7: "place a crafting table" with items [] must still build the crafting_table recipe tree
+    d = Decomposer(KNOWLEDGE, jev=StubJev(), llm=None)
+    for kind, item in [("equip", "wooden_pickaxe"), ("place", "crafting_table")]:
+        plan, problems = d._validate_plan({"items": [], "final": {"kind": kind, "item": item}})
+        assert not problems and plan["items"] == [{"item": item, "count": 1}], (kind, plan, problems)
+    plan, _ = d._validate_plan({"items": [], "final": {"kind": "status", "item": None,
+                                                        "verify": {"status_at_least": {"field": "food", "min": 20}}}})
+    assert plan["items"] == []  # a status goal has no item to obtain

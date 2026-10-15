@@ -13,7 +13,9 @@ import os
 import re
 from typing import Any
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# OPENAI_MODEL (set in .env) wins; the fallback matches it so a missing .env does not
+# silently drop the builder to a weak model (the seven-rewrite run predates the switch)
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6.1-sol")
 
 Message = dict[str, str]
 

@@ -164,12 +164,21 @@ class VoyagerEnv(gym.Env):
         """``POST /agent/verify``: evaluate one VerifySpec against the live world; ``{ok, detail}``."""
         return self._post("/agent/verify", {"spec": spec})
 
-    def agent_primitive(self, name: str, source: str, purpose: str | None = None) -> Dict[str, Any]:
+    def agent_primitive(
+        self, name: str, source: str, purpose: str | None = None, *, repair: bool = False, version: int | None = None
+    ) -> Dict[str, Any]:
         """``POST /agent/primitive``: register a generated action; ``{ok, error}``.
-        ``purpose`` is the subtask it was learned for; Jev sees it on the menu line."""
-        body = {"name": name, "source": source}
+        ``purpose`` is the subtask it was learned for; Jev sees it on the menu line.
+        ``repair`` re-registers a fixed version of an existing action: its trial counts
+        start fresh and a retired action comes back on the menu. ``version`` is the
+        builder's version number for it."""
+        body: Dict[str, Any] = {"name": name, "source": source}
         if purpose:
             body["purpose"] = purpose
+        if repair:
+            body["repair"] = True
+        if version:
+            body["version"] = int(version)
         return self._post("/agent/primitive", body, timeout=30)
 
     def agent_primitive_remove(self, name: str) -> Dict[str, Any]:

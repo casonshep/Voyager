@@ -40,7 +40,7 @@ class CurriculumAgent:
     def progress(self) -> int:
         return len(self.completed_tasks)
 
-    def render_observation(self, snap: dict[str, Any] | None) -> str:
+    def render_observation(self, snap: dict[str, Any] | None, hints: list[str] | None = None) -> str:
         snap = snap or {}
         bot = snap.get("bot") or {}
         inv = snap.get("inventory") or {}
@@ -61,9 +61,14 @@ class CurriculumAgent:
         ]
         if self.long_term_goal:
             lines.append(f"Long-term direction: {self.long_term_goal}")
+        if hints:
+            # "test next" items from the post-goal review lesson files: open questions the
+            # bot's own play raised. Suggestions, not orders.
+            lines.append("Open questions from earlier play (a goal that tests one is useful): " + "; ".join(h[:160] for h in hints[:5]))
         return "\n".join(lines)
 
-    def propose_goal(self, snap: dict[str, Any] | None, *, rejected: list[str] | None = None, max_retries: int = 3) -> str:
+    def propose_goal(self, snap: dict[str, Any] | None, *, rejected: list[str] | None = None, max_retries: int = 3,
+                     hints: list[str] | None = None) -> str:
         """One GPT call; returns the goal text. The first goal of a fresh run is fixed."""
         if self.progress == 0 and not self.failed_tasks and not rejected:
             return "Obtain 1 wood log"
@@ -71,7 +76,7 @@ class CurriculumAgent:
             raise RuntimeError("CurriculumAgent has no LLM handle")
         messages = [
             {"role": "system", "content": load_prompt("curriculum")},
-            {"role": "user", "content": self.render_observation(snap)},
+            {"role": "user", "content": self.render_observation(snap, hints)},
         ]
         if rejected:
             messages.append({"role": "user", "content": "Do not propose any of these again: " + "; ".join(rejected)})

@@ -79,8 +79,9 @@ record: [PLAN.md](PLAN.md)):
 | System | Where | What it does |
 | --- | --- | --- |
 | Decomposer | `voyager/tree/decomposer.py` | Turns a GPT goal ("obtain a stone pickaxe") into a tree of subtasks. Every node has a code-checkable `VerifySpec` (`has_item`, `near_block`, `has_tool_tier`, ...). Recipes, tool tiers, furnaces and fuel come from `GET /knowledge` (minecraft-data plus `lib/mcKnowledge.js`). One node per item, sized for whole-tree demand; a node's `done` flag is persisted the moment it verifies. |
-| Jev action loop | `voyager/env/mineflayer/lib/agentLoop.js` | Runs one subtask at a time. Each decision: observe (`lib/observe.js`), build a menu, ask Jev one request (action Choice plus danger, progress and completable Nouls), execute one bounded action, record outcome and state delta, check the spec. The starting menu is movement and looking only (`lib/baseActions.js`). |
-| Action builder | `voyager/tree/builder.py` | Every 10 actions Jev is asked whether the subtask is completable with the proven menu. On "no", Jev picks the kind and target of the missing action, GPT writes one mineflayer primitive (`menu` / `execute` / optional `observe`), it is statically checked, registered as a trial, and persisted under `<ckpt>/primitives/` (the skill library). |
+| Jev action loop | `voyager/env/mineflayer/lib/agentLoop.js` | Runs one subtask at a time. Each decision: observe (`lib/observe.js`), build a menu, digest the snapshot into words (`lib/jevState.js`), ask Jev one request (action Choice over the shuffled menu plus `none_of_these`, a `completable` Noul over the whole menu, a danger Noul, a progress Score, and per-option "would this change anything" Nouls), execute one bounded action, label the outcome (`lib/outcomes.js`), log the record to `decisions.jsonl`, check the spec. The starting menu is movement and looking only (`lib/baseActions.js`). |
+| Action builder | `voyager/tree/builder.py` | When the `completable` Noul stays below 0.5 over a 10-action window, or on stuck routing, the builder first **repairs** a failing action built for the subtask in place (same name, full source, every labelled outcome, earlier versions; up to 3 repairs, then the best version that ever worked is restored). Otherwise Jev picks the kind and target of the missing action and GPT writes one mineflayer primitive (`menu` / `execute` / optional `observe`). Drafts are checked, registered as trials, and persisted with versions under the library. Prompts carry the closest completed trace and the family lesson. Builds run on a background thread. |
+| Post-goal review | `voyager/tree/review.py` | After each goal, a fresh-context GPT call per lesson family reads that goal's decision records and rewrites `lessons/<family>.md` (Tried / Observed / Still doubt / Test next, each bullet citing record ids) and the remedy store. The builder reads the lessons; the curriculum reads the "Test next" items. |
 | Traversal | `voyager/tree/traversal.py` | Post-order over the tree. Routes stuck and budget triggers: build, retry with half the budget, re-decompose the node, or fail the chain and ask GPT for a new goal. |
 
 Jev never sees code: the one-line description a primitive's `menu()` writes
@@ -99,9 +100,14 @@ venv/Scripts/python run_tree.py --help
 ```
 
 Checkpoints: `<ckpt>/tree/<goal_id>.json` (the tree with done flags and
-traces), `<ckpt>/primitives/<name>.js` + `.json` (generated actions),
-`<ckpt>/typesafe/*.jsonl` (every Jev request and answer),
-`<ckpt>/curriculum/` (goals completed and failed).
+traces), `<ckpt>/decisions.jsonl` (one record per action: what the bot saw,
+Jev's answer, the action, its labelled outcome, timings),
+`<ckpt>/typesafe/*.jsonl` (Jev requests, builds, repairs, reviews),
+`<ckpt>/curriculum/` (goals completed and failed). The shared library
+(`--library`, default `skill_library/tree`) holds `<name>.js` + `.json`
+(learned actions), `versions/` (earlier versions of repaired actions),
+`traces/` (records of completed subtasks), `lessons/` (review output), and
+`_archive/` (pruned duplicates).
 
 ## Offline checks (no Minecraft, no keys)
 

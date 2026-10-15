@@ -335,24 +335,52 @@ VerifySpec, allowed block types, and budget. Node then loops:
 ```
 snap = observe()
 menu = baseActions.menu(snap) + registry.menuEntries(snap)
-answers = jev.systemOne({ state: snap, questions })
-run action; append action record; check verify
+answers = jev.systemOne({ state: jevState.digest(snap), questions })
+run action; append action record; log it to decisions.jsonl; check verify
 ```
 
-Questions in one request:
+**Revised 2026-10-13 (EVALUATION.md R3, R5).** Jev reads `jevState.digest(snap)`,
+not the raw snapshot: offsets become "6 blocks north-east, 1 above, out of
+reach", the view ray becomes `looking_at`, horizon samples become "trees at
+24", action records become one line with their outcome label. Primitives still
+read the raw snapshot. Questions in one request:
 
 | id | primitive | asks |
 | --- | --- | --- |
-| `action` | Choice over menu | which single action makes the most progress on `subtask.description` now |
+| `action` | Choice over the menu **plus `none_of_these`**, option order shuffled per request | which single action makes the most progress on the subtask now; `none_of_these` when nothing on the menu can |
+| `completable` | Noul over the **whole** menu (`menu` in the state, trials included) | can the subtask be completed with these actions, taken as often as needed |
 | `danger` | Noul | immediate physical danger that must be handled first |
-| `progress` | Noul | judging from `recent` and `since_progress`, is the agent making progress |
-| `completable` | Noul | can `subtask.description` be completed using only the actions on the menu |
+| `progress` | Score, 4 situation levels | which situation describes the last few actions (0 = nothing that matters changes ... 3 = the subtask's own target advanced) |
+| `effect_N` | Noul per non-move option (up to 14) | would this option change anything observable right now |
 
-Code reads `completable` on every decision but acts on it only every 10
-actions: a `no` at that checkpoint fires the builder. A build cooldown
-prevents a second build while a trial action from the last build is still
-untested. `progress` is used only by stuck routing (section 8). Confidence
-below 0.2 on `action` falls back to the least recently used movement action.
+`completable` is a plan-level question (can this menu EVER finish the
+subtask); `none_of_these` is step-level (does any option help RIGHT NOW). They
+differ: with a movement-only menu and a "get 3 logs" subtask, live Jev answered
+`completable` 0.12 to 0.14 while `1 - P(none_of_these)` was 0.76 to 0.87; with a
+mining action added, `completable` rose to 0.52. So `completable` drives the
+builder and stuck routing, and `none_of_these` only keeps sampling honest; it
+is never executed and is logged as `none`. The old Noul's fault (F4) was being
+asked over proven actions only, which kept it near 0.1 whenever a trial
+existed; it is now asked over the whole menu. At each 10-action checkpoint (5
+while the menu has no learned action) the mean `completable` over the window
+below 0.5 fires `builder_wanted`, unless a trial action is untested. Sampling
+renormalises over the real options and leaves out options whose effect Noul is
+below 0.15, except a freshly repaired action, whose predecessor's failures are
+marked "(earlier version; repaired since)" in `recent` and whose menu line says
+it was repaired. Progress level 0 on three decisions in a row (once there are
+at least three records) is the soft stuck signal.
+
+**Holding (added 2026-10-13, after the 20:21 and 20:27 runs).** When
+`none_of_these` is Jev's top choice with P >= 0.5 and danger is low, the loop
+does not run a leftover option. It holds still for 1.5 s, spends no action
+budget, adds nothing to `recent`, logs a `HOLD` record, and pushes
+`builder_wanted` with `reason: "none_of_these"` at the start of a hold streak
+and every 6 holds after. Holding is capped at 120 s per posting of a subtask,
+after which the loop acts on the remaining options again. Before this, leftovers
+were mostly looks and turns that changed nothing (42% of the 20:27 run's
+actions) and burned the budget the requested build needed. Confidence below 0.2 on `action` falls back to
+the least recently used movement action. The 500 ms floor is unchanged until
+the decision log has measured Jev latency.
 
 ### 5.3 Done
 
@@ -365,6 +393,29 @@ records it on the node and moves to the next node.
 
 `builder.py`, replacing `generator.py`. Triggered by `completable` low (5.2) or
 by stuck routing (section 8).
+
+**Repair before design (revised 2026-10-13, EVALUATION.md R1).** Step 0: if an
+action built for this subtask has run at least twice in its current version
+without a success, including one Node retired after three failures, it is
+**repaired in place**: same name, the full source, every outcome of this
+version with its typed label (`lib/outcomes.js`) and decision-record id, label
+hints, earlier versions' results, and the experience block below. The draft
+compiles under `<name>_draft` until it passes every check, then replaces the
+real action through `POST /agent/primitive {repair: true, version}`, which
+resets its trial counts; the old source is archived as
+`versions/<name>.v<k>.js`. After `max_repairs` (3) the best earlier version that
+ever succeeded is restored; if none did, the action is `final_retired` and its
+kind closes for this subtask. A design whose kind and target match an action
+already built for this subtask repairs that action instead of minting
+`name_2`. Every kind stays open to Jev's design question except kinds that are
+stale or final-retired for this subtask; Jev's state lists the learned actions
+per kind and whether each is offered now (F2). Every builder prompt carries an
+experience block: the single closest completed trace of a similar step
+(`<library>/traces/`) and the family lesson plus matching remedies from the
+post-goal review (section 12). Builds run on one worker thread (section 8);
+every `None` return records `last_refusal`, and builder GPT calls are timed as
+`llm.builder`. `reload(proven_only=True)` first archives duplicate (kind,
+target, purpose) entries and entries untried after 3 runs to `_archive/`.
 
 1. **Kind** (Jev Choice over `craft | smelt | mine | place | use_block |
    equip | collect | attack | goto_nearest | other`) given the subtask, the
@@ -401,10 +452,10 @@ without updating this table.
 | Route | Body | Returns |
 | --- | --- | --- |
 | `GET /knowledge` | | see below |
-| `POST /agent/subtask` | `{id, description, verify, allowed_blocks: [..], budget_actions, kind, work, requires, tree_items: [..]}` | `{ok}` |
+| `POST /agent/subtask` | `{id, description, verify, allowed_blocks: [..], budget_actions, kind, work, requires, tree_items: [..], goal_id, decision_log}` | `{ok}`; `decision_log` is an absolute path Node appends one JSON line per action to |
 | `GET /agent/status` | | see below |
 | `POST /agent/verify` | `{spec}` | `{ok: bool, detail: string}` |
-| `POST /agent/primitive` | `{name, source}` | `{ok: bool, error: string|null}` |
+| `POST /agent/primitive` | `{name, source, purpose?, repair?, version?, remove?}` | `{ok: bool, error: string|null, ...}`; `repair: true` replaces an existing action with fresh trial counts |
 | `POST /agent/stop` | | `{ok}`; loop idles, no triggers raised |
 
 `GET /knowledge` returns:
@@ -447,7 +498,7 @@ Triggers are drained on each status read. Types and detail fields:
 
 | type | detail |
 | --- | --- |
-| `subtask_done` | `subtask_id`, `trace` |
+| `subtask_done` | `subtask_id`, `trace` (action ids), `records` (`{id, action, outcome, label, delta}` for each action) |
 | `builder_wanted` | `subtask_id`, `completable` (float), `menu` (ids) |
 | `stuck` | `subtask_id`, `kind` in `position / inventory / repeat / health / progress` |
 | `budget_exhausted` | `subtask_id`, `actions_spent` |
@@ -464,7 +515,7 @@ Hard triggers in Node (cheap, every action):
 * same action id chosen 5 times in a row
 * health dropped 6 or more in the last 5 actions with no attack-kind action on the menu
 
-Soft trigger: `progress` Noul below 0.3 on three consecutive decisions.
+Soft trigger: `progress` Score at level 0 on three consecutive decisions.
 
 Routing in `traversal.py`:
 
@@ -474,6 +525,25 @@ Routing in `traversal.py`:
 | `completable` high + progress low, hard trigger fired | **retry**: same subtask, `recent` kept in state, budget halved, failed action ids cooled down for 4 decisions |
 | budget exhausted twice | **re-decompose** this node only (different recipe, or a `locate` child inserted) |
 | re-decompose fails | mark node `failed`, fail parent chain, ask GPT for a new high goal |
+
+**Revised 2026-10-13 (EVALUATION.md R3, F3).** A re-post after the retries are
+used up gets the node's full budget, not the halved one. A craft, smelt or
+place node whose inputs are all in hand gets a forced build at its second
+exhaustion; afterwards its exhaustion count restarts at 0 with the full budget,
+and two forced builds in a row that produce nothing hand over to
+re-decomposition (`forced_builds_exhausted`). Before this, one node cycled
+exhaust, forced build (nothing), re-post with 7 actions about twenty times in a
+minute. Non-forced builds run on one background thread (`async_builds`, on in
+`run_tree.py`): a request while a build is running is logged as
+`build_skipped`, and polling never stops for a build.
+
+**Grace rounds (added 2026-10-13).** At the exhaustion that would re-decompose or
+fail a node, traversal first checks whether help is on its way: a build for this
+node still running (it waits for it, then reads a fresh status) or an action
+built for this node that has not been tried yet (`builder.untested_for`). If so,
+the exhaustion does not count and the node is re-posted with its full budget, up
+to 2 such rounds per node (`grace_round` events). In both runs of 2026-10-13 the
+repaired action registered 7 to 33 s after its node had already failed.
 
 ---
 
@@ -663,3 +733,33 @@ builder (with keys) or the retry / re-decompose / fail-chain routes (with
 `--no-jev`). The knowledge fixture is now real `GET /knowledge` output for
 1.19. Still unverified: in-game movement with raw control states, and the
 first live GPT-built mine action. Acceptance commands are in README "Run".
+
+## 12. Experience and post-goal review (added 2026-10-13)
+
+From EVALUATION.md R2 and R4, after the four papers logged in
+`.claude/research/`.
+
+* **Decision records.** Node appends one JSON line per action to
+  `<ckpt>/decisions.jsonl`: id (`<runTag>-<n>`), goal and subtask ids, a state
+  digest, the menu ids, Jev's top probabilities, confidence and source,
+  `completable`, `none`, progress level, danger, effect Nouls, the action, its
+  outcome, its typed label, the delta, `jev_ms` and `act_ms`. Every lesson,
+  remedy and repair cites these ids. `voyager/tree/experience.py` reads them.
+* **Traces.** On `subtask_done`, the records are kept in
+  `<library>/traces/<family>.jsonl`; the builder retrieves the single closest
+  one (word overlap within the same family).
+* **Review.** After each goal (`run_tree.py`, skip with `--no-review`),
+  `voyager/tree/review.py` makes one fresh-context GPT call per lesson family
+  that had at least 3 records (up to 4 families). It reads only that goal's
+  records, the tree outcome, the current lesson file and the family's
+  remedies, and rewrites `<library>/lessons/<family>.md` with the sections
+  Tried / Observed / Still doubt / Test next, at most 1000 words, every bullet
+  citing a record id. The previous file goes to `lessons/history/`. Remedies
+  `{failure_type, repair_action, scope}` need evidence ids from the goal; they
+  start as `hypothesis`, become `confirmed` when two goals support them with
+  no contradiction, and `disputed` after two contradictions.
+* **Use.** The builder prompt loads the family lesson and matching remedies,
+  labelled as claims rather than ground truth. The curriculum sees the "Test
+  next" items as open questions. Jev never sees lessons or code.
+* **Not done yet.** The builder `CONTRACT` keeps its full API guidance; it
+  should shrink only once lesson files exist and are shown to cover it.

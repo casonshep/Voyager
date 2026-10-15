@@ -474,8 +474,10 @@ class Decomposer:
                         problems.append(f"final.verify is invalid: {'; '.join(bad)}")
                     else:
                         verify = catalog.normalize(verify).to_json()
-                if kind == "equip" and item and not any(i["item"] == item for i in items):
-                    items.append({"item": item, "count": 1})  # you cannot equip what you never obtained
+                if kind in FINAL_WORK_KINDS and item and self._known(item) and not any(i["item"] == item for i in items):
+                    # you cannot equip, place, eat or use what you never obtained: without this
+                    # the tree is a single work node with no way to get the item (F7)
+                    items.append({"item": item, "count": 1})
                 final = {"kind": kind, "item": item or None, "slot": slot or None, "verify": verify}
         if not items and final is None:
             problems.append("the plan needs at least one item or a final step")

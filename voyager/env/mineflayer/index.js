@@ -284,7 +284,10 @@ app.post("/agent/primitive", async (req, res) => {
     // active: before one is posted (reloading the library at startup) snap.subtask is
     // null, and a correct action that reads its progress would be wrongly rejected.
     const smokeSnap = loop.subtask ? snap : null;
-    const result = loop.registry.register(name, String(b.source || ""), smokeSnap, b.purpose ? String(b.purpose) : null);
+    const result = loop.registry.register(name, String(b.source || ""), smokeSnap, b.purpose ? String(b.purpose) : null, {
+        repair: Boolean(b.repair),
+        version: b.version,
+    });
     if (result.ok && b.repaired) loop.registry.markRepaired(name);
     // Applicability check: would menu() offer this action in the world as it is now?
     // An action that is never offered can never be tried, so the builder needs to know

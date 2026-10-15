@@ -28,6 +28,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 DEFAULT_BUDGET = 60
@@ -77,11 +78,14 @@ class Traversal:
         node_seconds_limit: float = 900.0,
         max_retries_per_node: int = 3,
         exhaustions_before_redecompose: int = 2,
+        max_forced_build_failures: int = 2,
+        max_grace_rounds: int = 2,
         completable_threshold: float = 0.5,
         redecompose: Callable[[Any, str], Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        async_builds: bool = False,
     ):
         self.tree = tree
         self.bridge = bridge
@@ -93,14 +97,28 @@ class Traversal:
         self.node_seconds_limit = node_seconds_limit
         self.max_retries_per_node = max_retries_per_node
         self.exhaustions_before_redecompose = exhaustions_before_redecompose
+        self.max_forced_build_failures = max_forced_build_failures
+        # A node is not given up while help for it is on its way: a build for it still
+        # running, or an action built for it that has not been tried yet. Each such
+        # exhaustion buys one more round (with the full budget), up to this many.
+        self.max_grace_rounds = max_grace_rounds
         self.completable_threshold = completable_threshold
         self._redecompose = redecompose
         self._sleep = sleep
         self._now = now
         self._on_event = on_event
+        # Builds (one GPT conversation, up to a minute) run on one worker thread so the
+        # poll loop keeps reading triggers while the bot keeps acting. One slot: a build
+        # request while one is running is skipped, not queued. Forced builds stay
+        # synchronous because their result decides what happens to the node next.
+        self.async_builds = async_builds
+        self._executor: ThreadPoolExecutor | None = None
+        self._pending: tuple[Any, str, str] | None = None  # (future, node id, reason)
         self.failed: set[str] = set()
         self.exhaustions: dict[str, int] = {}
         self.retries: dict[str, int] = {}
+        self.forced_failures: dict[str, int] = {}  # node id -> forced builds in a row that produced nothing
+        self.grace: dict[str, int] = {}  # node id -> extra rounds given while a build or an untested action was pending
         self.events: list[dict[str, Any]] = []
         self.goal_id = _g(tree, "goal_id") or _g(tree, "id") or _slug(_g(tree, "goal", "goal"))
         os.makedirs(os.path.join(ckpt_dir, "tree"), exist_ok=True)
@@ -109,6 +127,10 @@ class Traversal:
     # ------------------------------------------------------------------ #
     # persistence
     # ------------------------------------------------------------------ #
+
+    @property
+    def decision_log(self) -> str:
+        return os.path.abspath(os.path.join(self.ckpt_dir, "decisions.jsonl"))
 
     @property
     def tree_path(self) -> str:
@@ -126,7 +148,8 @@ class Traversal:
             with open(self.tree_path, "w", encoding="utf-8") as fh:
                 fh.write(data)
             with open(self.run_path, "w", encoding="utf-8") as fh:
-                json.dump({"failed": sorted(self.failed), "exhaustions": self.exhaustions, "retries": self.retries}, fh, indent=2)
+                json.dump({"failed": sorted(self.failed), "exhaustions": self.exhaustions, "retries": self.retries,
+                           "forced_failures": self.forced_failures, "grace": self.grace}, fh, indent=2)
         except Exception as exc:
             self._event("save_failed", {"error": str(exc)})
 
@@ -139,6 +162,8 @@ class Traversal:
             self.failed = set(data.get("failed") or [])
             self.exhaustions = dict(data.get("exhaustions") or {})
             self.retries = dict(data.get("retries") or {})
+            self.forced_failures = dict(data.get("forced_failures") or {})
+            self.grace = dict(data.get("grace") or {})
         except Exception:
             pass
 
@@ -225,6 +250,10 @@ class Traversal:
             elif outcome == "failed":
                 break
             # "redecomposed" falls through: the tree changed, pick the next node again
+        self._collect_build(wait=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         root = self.root()
         status = "done" if root is not None and _g(root, "done") else "failed"
         try:
@@ -246,6 +275,10 @@ class Traversal:
             "work": dict(_g(node, "work") or {}),
             "requires": dict(_g(node, "requires") or {}),
             "tree_items": self.tree_items(),
+            # Node appends one record per action here; the goal id lets the post-goal
+            # review and the metrics pick out this goal's records (node ids repeat)
+            "goal_id": self.goal_id,
+            "decision_log": self.decision_log,
         }
 
     def run_node(self, node: Any) -> str:
@@ -264,6 +297,7 @@ class Traversal:
         failed_polls = 0
         while True:
             self._sleep(self.poll_seconds)
+            self._collect_build()
             try:
                 status = self.bridge.agent_status()
                 failed_polls = 0
@@ -294,10 +328,20 @@ class Traversal:
 
                 if ttype == "subtask_done":
                     self._mark_done(node, trace=trig.get("trace") or [])
+                    records = trig.get("records") or []
+                    if records and self.builder is not None and hasattr(self.builder, "remember"):
+                        try:
+                            self.builder.remember(payload, records, goal_id=self.goal_id)
+                        except Exception as exc:
+                            self._event("trace_save_failed", {"node": node_id, "error": str(exc)})
                     return "done"
 
                 if ttype == "builder_wanted":
-                    reason = f"Jev judged the subtask not completable with the current menu (completable={trig.get('completable')})"
+                    if trig.get("reason") == "none_of_these":
+                        reason = (f"Jev's top answer was that no action on the menu can move the subtask forward "
+                                  f"(none_of_these {trig.get('none')}, completable={trig.get('completable')}); the bot is holding still")
+                    else:
+                        reason = f"Jev judged the subtask not completable with the current menu (completable={trig.get('completable')})"
                     stale = trig.get("stale") or []
                     if stale:
                         # The previous build's menu() condition never matched the world
@@ -321,7 +365,9 @@ class Traversal:
                             outcome = self._exhausted(node, payload, status)
                             if outcome:
                                 return outcome
-                            budget = payload["budget_actions"]
+                            # a fresh round gets the node's full budget: carrying the halved
+                            # one forward made every re-post exhaust within a few actions (F3)
+                            budget = int(_g(node, "budget_actions") or DEFAULT_BUDGET)
                             payload = self._subtask_payload(node, budget)
                             self._post(node, payload)
                             started = self._now()
@@ -372,19 +418,56 @@ class Traversal:
         self._event("node_done", {"node": _g(node, "id"), "description": _g(node, "description"), "actions": len(trace)})
 
     def _build(self, node: Any, payload: dict[str, Any], status: dict[str, Any], *, reason: str, force: bool = False) -> str | None:
+        node_id = _g(node, "id")
         if self.builder is None:
-            self._event("builder_missing", {"node": _g(node, "id")})
+            self._event("builder_missing", {"node": node_id})
+            return None
+        if self.async_builds and not force:
+            self._collect_build()
+            if self._pending is not None:
+                self._event("build_skipped", {"node": node_id, "why": "a build is already running", "trigger": reason[:120]})
+                return None
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="builder")
+            future = self._executor.submit(self._call_builder, dict(payload), status, list(self.tree_items()), reason, force)
+            self._pending = (future, node_id, reason)
+            self._event("build_started", {"node": node_id, "trigger": reason[:120]})
             return None
         try:
-            name = self.builder.build(payload, status, self.tree_items(), reason, force=force)
-        except TypeError:  # a builder stub without the keyword
-            name = self.builder.build(payload, status, self.tree_items(), reason)
-        if name is not None or force:
-            self._event("build", {"node": _g(node, "id"), "name": name, "reason": reason})
-        if name is None:
-            why = getattr(self.builder, "last_refusal", None) or "the builder produced no action (GPT drafts all rejected)"
-            self._event("build_refused", {"node": _g(node, "id"), "why": why, "trigger": reason[:120]})
+            name = self._call_builder(payload, status, self.tree_items(), reason, force)
+        except Exception as exc:
+            self._event("build_failed", {"node": node_id, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            return None
+        self._report_build(node_id, name, reason, force)
         return name
+
+    def _call_builder(self, payload: dict[str, Any], status: dict[str, Any], tree_items: list[str], reason: str, force: bool) -> str | None:
+        try:
+            return self.builder.build(payload, status, tree_items, reason, force=force)
+        except TypeError:  # a builder stub without the keyword
+            return self.builder.build(payload, status, tree_items, reason)
+
+    def _report_build(self, node_id: str, name: str | None, reason: str, force: bool) -> None:
+        if name is not None or force:
+            self._event("build", {"node": node_id, "name": name, "reason": reason})
+        if name is None:
+            why = getattr(self.builder, "last_refusal", None) or "the builder produced no action (no reason recorded)"
+            self._event("build_refused", {"node": node_id, "why": why, "trigger": reason[:120]})
+
+    def _collect_build(self, wait: bool = False) -> None:
+        """Report a finished background build (or wait for the running one)."""
+        if self._pending is None:
+            return
+        future, node_id, reason = self._pending
+        if not wait and not future.done():
+            return
+        self._pending = None
+        try:
+            name = future.result()
+        except Exception as exc:
+            self._event("build_failed", {"node": node_id, "error": f"{type(exc).__name__}: {exc}"[:300]})
+            return
+        self._report_build(node_id, name, reason, False)
 
     def _inputs_in_hand(self, node: Any, status: dict[str, Any]) -> bool:
         """True when every item in the node's `requires` is already in the inventory."""
@@ -411,17 +494,37 @@ class Traversal:
         self.save()
         if n < self.exhaustions_before_redecompose:
             return None
+        # Help is on its way: do not re-decompose or fail the node yet. In both runs of
+        # 2026-10-13 the repaired action registered 7 to 33 s after its node had already
+        # failed, so it was never tried.
+        if self._grant_grace(node, status):
+            self.exhaustions[node_id] = n - 1  # this exhaustion does not count
+            self.save()
+            return None
         # A craft/smelt/place step whose inputs are all in the bag has nothing to
         # gain from another recipe: the missing piece is the action itself.
-        if (_g(node, "kind") in ("craft", "smelt", "place")) and self._inputs_in_hand(node, status or {}):
+        forced_failures = self.forced_failures.get(node_id, 0)
+        if (
+            (_g(node, "kind") in ("craft", "smelt", "place"))
+            and self._inputs_in_hand(node, status or {})
+            and forced_failures < self.max_forced_build_failures
+        ):
             self._event("inputs_in_hand", {"node": node_id, "requires": _g(node, "requires")})
-            self._build(
+            name = self._build(
                 node, payload, status or {}, force=True,
                 reason=(f"every input for '{_g(node, 'description')}' is already in the inventory "
                         f"({_g(node, 'requires')}); the bot only lacks an action that performs the step itself"),
             )
-            self.exhaustions[node_id] = 1  # another full budget before re-decomposing is considered again
+            # A forced build that produced nothing counts toward a cap; without one the node
+            # cycled exhaust -> build(None) -> re-post every few seconds (F3).
+            self.forced_failures[node_id] = 0 if name else forced_failures + 1
+            # the next round starts from zero exhaustions with the full budget, so the new
+            # action gets a real chance before another forced build or a re-decomposition
+            self.exhaustions[node_id] = 0
+            self.save()
             return None
+        if forced_failures >= self.max_forced_build_failures:
+            self._event("forced_builds_exhausted", {"node": node_id, "failures": forced_failures})
         if self._try_redecompose(node_id):
             self.exhaustions[node_id] = 0
             self.retries[node_id] = 0
@@ -430,6 +533,35 @@ class Traversal:
             return "redecomposed"
         self._fail_chain(node)
         return "failed"
+
+    def _grant_grace(self, node: Any, status: dict[str, Any] | None) -> bool:
+        """One more round when a build for this node is running (wait for it to finish
+        first) or an action built for it is still untested. Capped per node."""
+        node_id = _g(node, "id")
+        used = self.grace.get(node_id, 0)
+        if used >= self.max_grace_rounds:
+            return False
+        pending = self._pending is not None and self._pending[1] == node_id
+        if pending:
+            self._event("waiting_for_build", {"node": node_id, "round": used + 1})
+            self._collect_build(wait=True)
+        untested: list[str] = []
+        if self.builder is not None and hasattr(self.builder, "untested_for"):
+            fresh = status or {}
+            if pending:
+                try:  # the build just registered a new action: read it from a fresh status
+                    fresh = self.bridge.agent_status()
+                except Exception:
+                    fresh = status or {}
+            try:
+                untested = list(self.builder.untested_for(node_id, fresh) or [])
+            except Exception:
+                untested = []
+        if not pending and not untested:
+            return False
+        self.grace[node_id] = used + 1
+        self._event("grace_round", {"node": node_id, "round": used + 1, "waited_for_build": pending, "untested": untested})
+        return True
 
     def _try_redecompose(self, node_id: str) -> bool:
         fn = self._redecompose

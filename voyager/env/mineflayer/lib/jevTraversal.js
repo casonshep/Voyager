@@ -24,6 +24,24 @@ const COMPASS = {
 let client; // undefined = not initialized, null = unavailable
 let choiceFn;
 let noulFn;
+let scoreFn;
+
+// The question builders (choice, noul, score) are plain functions: load them
+// whenever the package is installed, key or not, so questions can be built and
+// inspected offline.
+let sdkLoaded = false;
+function loadSdk() {
+    if (sdkLoaded) return;
+    sdkLoaded = true;
+    try {
+        const sdk = require("@typesafe-ai/sdk");
+        choiceFn = sdk.choice;
+        noulFn = sdk.noul;
+        scoreFn = sdk.score;
+    } catch (err) {
+        /* no SDK: callers fall back to code paths */
+    }
+}
 
 function getClient() {
     if (client !== undefined) return client;
@@ -37,6 +55,7 @@ function getClient() {
         client = new sdk.TypeSafeClient();
         choiceFn = sdk.choice;
         noulFn = sdk.noul;
+        scoreFn = sdk.score;
     } catch (err) {
         console.log("jev: TypeSafe SDK unavailable:", err.message);
         client = null;
@@ -81,11 +100,15 @@ module.exports = {
     DECISION_TIMEOUT_MS,
     MIN_CONFIDENCE,
     get choiceFn() {
-        getClient();
+        loadSdk();
         return choiceFn;
     },
     get noulFn() {
-        getClient();
+        loadSdk();
         return noulFn;
+    },
+    get scoreFn() {
+        loadSdk();
+        return scoreFn;
     },
 };

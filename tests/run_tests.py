@@ -12,7 +12,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-MODULES = ["test_tree", "test_traversal", "test_builder"]
+MODULES = ["test_tree", "test_traversal", "test_builder", "test_review"]
 selected = sys.argv[1:] or MODULES
 
 failed = 0

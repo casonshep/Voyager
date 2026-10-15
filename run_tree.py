@@ -40,6 +40,8 @@ def parse_args(argv=None):
                         help="shared dir of learned actions; proven ones are reloaded every run ('' = per-run only)")
     parser.add_argument("--node-seconds", type=float, default=900.0, help="wall-clock limit per subtask before it counts as exhausted")
     parser.add_argument("--long-term-goal", default=None, help="direction shown to the curriculum")
+    parser.add_argument("--no-review", action="store_true", help="skip the post-goal review that writes lesson files")
+    parser.add_argument("--sync-builds", action="store_true", help="run builds on the poll thread (debugging)")
     return parser.parse_args(argv)
 
 
@@ -59,6 +61,8 @@ def main(argv=None) -> int:
 
     from voyager import Voyager
     from voyager.tree.builder import ActionBuilder
+    from voyager.tree.experience import read_decisions
+    from voyager.tree.review import GoalReviewer, LessonBook
     from voyager.tree.traversal import BotDisconnected, Traversal
 
     resume = args.resume is not None
@@ -81,7 +85,11 @@ def main(argv=None) -> int:
     try:
         voyager.start()
         knowledge = voyager.knowledge()
-        builder = ActionBuilder(env, jev, llm, ckpt_dir=ckpt_dir, library_dir=args.library or None)
+        # lessons live next to the learned actions so they carry across runs
+        book = LessonBook(args.library or ckpt_dir)
+        builder = ActionBuilder(env, jev, llm, ckpt_dir=ckpt_dir, library_dir=args.library or None, lessons=book)
+        log_fn = (lambda kind, rec: jev.log_only(kind, rec)) if hasattr(jev, "log_only") else None
+        reviewer = None if args.no_review else GoalReviewer(llm, book, log=log_fn)
         if args.library:
             n = builder.reload(proven_only=True)
             print(f"\033[35mSkill library {args.library}: {n} learned action(s) loaded\033[0m")
@@ -121,7 +129,7 @@ def main(argv=None) -> int:
                     snap = env.agent_status().get("snap")
                 except Exception as exc:
                     print(f"status before proposing a goal failed: {exc}")
-                goal = args.goal if args.goal and goals_run == 0 else curriculum.propose_goal(snap, rejected=rejected)
+                goal = args.goal if args.goal and goals_run == 0 else curriculum.propose_goal(snap, rejected=rejected, hints=book.test_next())
                 print(f"\033[35mGoal: {goal}\033[0m")
                 tree = decomposer.build(goal)  # nodes already satisfied by the world come back done
 
@@ -129,6 +137,7 @@ def main(argv=None) -> int:
                 tree, env, jev, builder, knowledge=knowledge, ckpt_dir=ckpt_dir,
                 poll_seconds=args.poll, node_seconds_limit=args.node_seconds,
                 redecompose=decomposer.redecompose,
+                async_builds=not args.sync_builds,
             )
             os.makedirs(os.path.dirname(current_path), exist_ok=True)
             with open(current_path, "w", encoding="utf-8") as fh:
@@ -146,6 +155,16 @@ def main(argv=None) -> int:
                         raise
                     voyager.start()  # soft reset: rejoin, keep the inventory; done nodes stay done
             success = result.get("status") == "done"
+            if reviewer is not None:
+                # fresh-context review of this goal's raw decision records -> lesson files
+                try:
+                    nodes = [n.to_json() if hasattr(n, "to_json") else dict(n) for n in traversal.tree.post_order()]
+                    decisions = read_decisions(traversal.decision_log, goal_id=traversal.goal_id)
+                    summary = reviewer.review(goal=goal, goal_id=traversal.goal_id, success=success, nodes=nodes, decisions=decisions)
+                    print(f"\033[34mReview: lessons updated for {summary.get('families') or 'no family'}; "
+                          f"{summary.get('remedies_added')} remedy(ies) added\033[0m")
+                except Exception as exc:
+                    print(f"\033[31mpost-goal review failed: {type(exc).__name__}: {exc}\033[0m")
             curriculum.record(goal, success)
             if not success:
                 rejected.append(goal)

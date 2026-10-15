@@ -24,13 +24,18 @@ is its whole interface to the agent.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
+import shutil
+import threading
 import time
 from typing import Any
 
 from voyager.tree import catalog
+from voyager.tree.experience import TraceStore, family_of, render_trace
+from voyager.utils import timing
 
 try:
     from typesafe_sdk import Choice
@@ -50,7 +55,21 @@ FORBIDDEN = [
     (re.compile(r"\bimport\s*\("), "dynamic import"),
 ]
 
-WORK_STEP_KINDS = ("craft", "smelt", "place", "equip", "eat", "use")  # node kinds whose action kind is known from the tree
+WORK_STEP_KINDS = ("craft", "smelt", "place", "equip", "eat", "use")
+
+# What each typed outcome label (lib/outcomes.js) usually means for the code that
+# produced it. Shown to the model in a repair prompt next to the evidence.
+LABEL_HINTS = {
+    "API_MISUSE": "a mineflayer call got the wrong argument type; the outcome text says what was expected. Fix exactly that call",
+    "NOT_REACHABLE": "the target was out of reach or the path failed; approach it first (GoalNear within 2-3 blocks) or choose a reachable instance, and check the distance before acting",
+    "NO_TARGET": "nothing matching was found; the search is probably too narrow (family names like *_log, the radius) or the target is absent, in which case menu() should return null",
+    "NO_PLACE_SURFACE": "placing failed; choose a free air block above a SOLID block near the bot and place against the solid block under it",
+    "MISSING_INPUT": "an input item was missing; count the inventory family-aware and make menu() return null while inputs are absent",
+    "NO_EFFECT": "it reported ok but its declared purpose (or the world) did not change: it does not do what it claims, or returns ok too early (for example before picking up the drop)",
+    "TIMEOUT": "it ran past the 20 s limit; bound every wait and pathfinder call and do one step per call",
+    "MOVE_BLOCKED": "a walk could not move; route around or approach from another side",
+    "OTHER_FAILURE": "read the failure text",
+}  # node kinds whose action kind is known from the tree
 
 KINDS = {
     "mine": "dig the block the bot is looking at (or the nearest block of a type) and pick up the drop",
@@ -341,6 +360,8 @@ class ActionBuilder:
         max_live: int = 12,
         min_seconds_between_builds: float = 5.0,
         unpicked_decisions: int = 6,
+        max_repairs: int = 3,
+        lessons=None,
     ):
         """``bridge`` has ``agent_primitive``; ``jev`` is a ``JevClient`` (may be disabled);
         ``llm`` has ``complete(messages) -> str`` where messages are ``{"role", "content"}`` dicts."""
@@ -363,6 +384,17 @@ class ActionBuilder:
         self.last_refusal: str | None = None  # why the last build() returned None
         self.last_build_subtask: str | None = None  # the subtask the last build was for
         self.stale_kinds: dict[str, set[str]] = {}  # subtask id -> kinds whose trial was never applicable
+        # Repair, not rewrite: a failing action is fixed in place under the same name up to
+        # this many times (versions 2..max_repairs+1); old versions are kept in versions/.
+        self.max_repairs = max_repairs
+        self.versions_dir = os.path.join(self.dir, "versions")
+        # completed-subtask traces (raw evidence), retrieved one at a time into prompts
+        self.traces = TraceStore(self.dir)
+        # post-goal lessons (voyager.tree.review.LessonBook) or None
+        self.lessons = lessons
+        # builds may run on a worker thread while the poll loop records outcomes
+        self._lock = threading.RLock()
+        self.model_name = getattr(llm, "model", None)
 
     # ------------------------------------------------------------------ #
     # library
@@ -380,6 +412,8 @@ class ActionBuilder:
         were built for) is cleared so it cannot leak into this run's tree, whose node
         ids are reused.
         """
+        if proven_only:
+            self.prune()
         count = 0
         for name in self.saved():
             with open(os.path.join(self.dir, f"{name}.js"), encoding="utf-8") as fh:
@@ -424,6 +458,77 @@ class ActionBuilder:
         if count:
             self._say(f"reloaded {count} saved primitive(s) from {self.dir}")
         return count
+
+    def _read_sidecar(self, name: str) -> dict[str, Any]:
+        side = os.path.join(self.dir, f"{name}.json")
+        if not os.path.exists(side):
+            return {}
+        try:
+            with open(side, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def prune(self, untried_runs: int = 3) -> list[str]:
+        """Move duplicate and dead entries out of the library into ``_archive/``.
+
+        * Duplicates: entries with the same (kind, target, declared purpose) are one
+          skill written several times; the one with the most successes (then the best
+          success rate, then the newest) stays.
+        * Dead: an entry that has never been tried after being in the library for
+          ``untried_runs`` reloads.
+        Nothing is deleted; archived files can be moved back by hand. Returns the
+        archived names."""
+        archive = os.path.join(self.dir, "_archive")
+        entries = []
+        for name in self.saved():
+            meta = self._read_sidecar(name)
+            meta["runs_seen"] = int(meta.get("runs_seen") or 0) + 1
+            entries.append((name, meta))
+        groups: dict[str, list[tuple[str, dict[str, Any]]]] = collections.defaultdict(list)
+        for name, meta in entries:
+            key = json.dumps([meta.get("kind"), meta.get("target"), meta.get("purpose_spec")], sort_keys=True, default=str)
+            groups[key].append((name, meta))
+        drop: dict[str, str] = {}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            ranked = sorted(
+                members,
+                key=lambda nm: (
+                    int(nm[1].get("successes") or 0),
+                    (int(nm[1].get("successes") or 0) / int(nm[1].get("trials") or 1)),
+                    float(nm[1].get("created_at") or 0),
+                ),
+                reverse=True,
+            )
+            for name, _ in ranked[1:]:
+                drop[name] = f"duplicate of x:{ranked[0][0]}"
+        for name, meta in entries:
+            if name not in drop and int(meta.get("trials") or 0) == 0 and meta["runs_seen"] >= untried_runs:
+                drop[name] = f"never tried in {meta['runs_seen']} runs"
+        for name, meta in entries:
+            if name in drop:
+                os.makedirs(archive, exist_ok=True)
+                meta["archived"] = drop[name]
+                for ext in (".js", ".json"):
+                    src = os.path.join(self.dir, name + ext)
+                    if os.path.exists(src):
+                        shutil.move(src, os.path.join(archive, name + ext))
+                with open(os.path.join(archive, f"{name}.json"), "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, indent=2)
+                self._say(f"library: archived x:{name} ({drop[name]})")
+            else:
+                with open(os.path.join(self.dir, f"{name}.json"), "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, indent=2)
+        return sorted(drop)
+
+    def remember(self, subtask: dict[str, Any], records: list[dict[str, Any]], goal_id: str | None = None) -> None:
+        """Keep the raw action records of a completed subtask as an experience trace."""
+        entry = self.traces.save(description=str(subtask.get("description") or ""), kind=subtask.get("kind"),
+                                 records=records, goal_id=goal_id, node_id=subtask.get("id"))
+        if entry:
+            self._say(f"trace kept: '{entry['description']}' done in {entry['actions']} action(s)")
 
     def declare_purpose(self, name: str, source: str, meta: dict[str, Any]) -> str | None:
         """Ask the model to read an existing action and declare its PURPOSE. Returns the
@@ -480,7 +585,18 @@ class ActionBuilder:
 
         Node's counters restart every run, so the saved totals are the counts carried
         in from earlier runs (``base``) plus this run's. Overwriting them would make a
-        proven skill look unproven and drop it from the library."""
+        proven skill look unproven and drop it from the library.
+
+        Runs on the poll thread; when a build on the worker thread holds the lock this
+        poll's update is skipped (the next poll carries the same totals)."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._record_outcomes(status)
+        finally:
+            self._lock.release()
+
+    def _record_outcomes(self, status: dict[str, Any]) -> None:
         for p in status.get("primitives") or []:
             name = p.get("name")
             if not name or name not in self.registered:
@@ -602,21 +718,48 @@ class ActionBuilder:
     # ------------------------------------------------------------------ #
 
     def build(self, subtask: dict[str, Any], status: dict[str, Any], tree_items: list[str], reason: str = "", *, force: bool = False) -> str | None:
-        """Design, write, check, register and persist one primitive. Returns its name or None.
+        """Repair, or design, write, check, register and persist one primitive. Returns its name or None.
 
         ``force`` skips the time-based cooldown (not the untested-trial one): used
         when a work step's inputs are all in the inventory and only the action is missing.
+        Safe to call from a worker thread: the whole build holds the builder's lock.
         """
+        with self._lock:
+            return self._build(subtask, status, tree_items, reason, force=force)
+
+    def _build(self, subtask: dict[str, Any], status: dict[str, Any], tree_items: list[str], reason: str = "", *, force: bool = False) -> str | None:
         self.last_refusal = None
-        why_not = self.cooling_down(status, subtask.get("id"))
+        sid = subtask.get("id")
+        snap = status.get("snap") or {}
+        recent = status.get("recent") or []
+        menu = status.get("menu") or {}
+        # Repair comes first: an action built for this subtask that keeps failing is
+        # fixed in place, under its name, with its full evidence. Before this, a retired
+        # action was never repaired and GPT rewrote it from scratch as name_2, name_3 ... (F1).
+        repair = self._failing_trial(status, sid)
+        if repair is not None:
+            rname, rmeta = repair
+            if int(rmeta.get("version") or 1) > self.max_repairs:
+                restored = self._give_up_on(rname, status)
+                if restored:
+                    return restored  # an earlier version that worked is back on the menu
+            else:
+                self.last_build_at = time.time()
+                self.last_build_subtask = sid
+                self._status = status
+                return self._write_and_register(
+                    subtask, snap, recent, menu, tree_items,
+                    rmeta.get("kind") or "other", rmeta.get("target") or "none", reason, repair_of=rname,
+                )
+        why_not = self.cooling_down(status, sid)
         if why_not and "live already" in why_not:
             # the menu is full: retire the weakest generated action instead of refusing,
             # so a full menu never blocks the step that needs something new
-            evicted = self._evict_weakest(status, subtask.get("id"))
+            evicted = self._evict_weakest(status, sid)
             why_not = None if evicted else why_not
             if evicted:
                 status = {**status, "primitives": [p for p in status.get("primitives") or [] if p.get("name") != evicted]}
-                why_not = self.cooling_down(status, subtask.get("id"))
+                why_not = self.cooling_down(status, sid)
         if why_not and force and why_not != "builder disabled" and "live already" not in why_not:
             # inputs are in hand and only the work step is missing: neither the build
             # spacing nor an unrelated half-tested trial may hold this up
@@ -627,22 +770,10 @@ class ActionBuilder:
             self._say(f"not building for '{subtask.get('description')}': {why_not}")
             return None
         self.last_build_at = time.time()
-        self.last_build_subtask = subtask.get("id")
+        self.last_build_subtask = sid
         self._status = status
-        snap = status.get("snap") or {}
-        recent = status.get("recent") or []
-        menu = status.get("menu") or {}
         work = subtask.get("work") or {}
-        repair = self._failing_trial(status, subtask.get("id"))
-        if repair is not None:
-            # a fresh action for this subtask keeps failing: rebuild the SAME kind and
-            # target with its errors in view, instead of designing something new
-            rname, rmeta = repair
-            kind, target = rmeta.get("kind") or "other", rmeta.get("target") or "none"
-            reason = (f"REPAIR x:{rname}: it failed every time it ran (see its outcomes under EARLIER ATTEMPTS); "
-                      f"write a corrected {kind} action for {target} that avoids that failure. " + (reason or ""))
-            self._say(f"repairing x:{rname} ({kind} for {target}) for '{subtask.get('description')}'")
-        elif subtask.get("kind") in WORK_STEP_KINDS and work.get("item"):
+        if subtask.get("kind") in WORK_STEP_KINDS and work.get("item"):
             # The tree already knows what this step is: a craft, smelt or place of a
             # named item. Asking Jev which kind of action is missing only invites a
             # wrong guess (a collect action for a craft step), so skip the design.
@@ -654,28 +785,88 @@ class ActionBuilder:
             self._say(f"locate step '{subtask.get('description')}': building an explore action for {target}")
         else:
             kind, target = self._design(subtask, snap, recent, menu, tree_items)
-        name = self._write_and_register(subtask, snap, recent, menu, tree_items, kind, target, reason)
-        if repair is not None and name:
-            self.meta.setdefault(repair[0], {})["repaired_by"] = name
-            self._save_sidecar(repair[0])
-        return name
+        # A design that matches an action already built for this subtask is that action
+        # again: repair it if it can still be repaired, rather than minting a twin.
+        twin = self._same_design(sid, kind, target)
+        if twin is not None and int((self.meta.get(twin) or {}).get("version") or 1) <= self.max_repairs:
+            self._say(f"design {kind}/{target} matches x:{twin}; repairing it instead of writing a duplicate")
+            return self._write_and_register(subtask, snap, recent, menu, tree_items, kind, target, reason, repair_of=twin)
+        return self._write_and_register(subtask, snap, recent, menu, tree_items, kind, target, reason)
+
+    def untested_for(self, subtask_id: str | None, status: dict[str, Any]) -> list[str]:
+        """Live actions built for this subtask whose current version has not been tried
+        yet (and is not merely never applicable). Traversal does not give up on a node
+        while one of these is waiting for its first try."""
+        out = []
+        for p in status.get("primitives") or []:
+            name = p.get("name")
+            meta = self.meta.get(name) or {}
+            if name not in self.registered or meta.get("subtask_id") != subtask_id or meta.get("final_retired"):
+                continue
+            if p.get("retired") or p.get("stale") or int(p.get("trials") or 0) > 0:
+                continue
+            out.append(name)
+        return out
+
+    def _same_design(self, subtask_id: str | None, kind: str, target: str) -> str | None:
+        """A live action built for this subtask with the same kind and target that has
+        not succeeded in its current version, or None."""
+        for name, meta in self.meta.items():
+            if name not in self.registered or meta.get("subtask_id") != subtask_id or meta.get("final_retired"):
+                continue
+            if meta.get("kind") == kind and meta.get("target") == target and int(meta.get("successes") or 0) == 0:
+                return name
+        return None
 
     def _failing_trial(self, status: dict[str, Any], subtask_id: str | None):
-        """A fresh action built for this subtask that has run at least twice and never
-        succeeded (and is not merely never applicable): the one to repair. Returns
-        (name, meta) for the most recent such action, or None."""
+        """An action built for this subtask whose current version has run at least twice
+        without a success, including one Node has taken off the menu (retired) after
+        three failures: the one to repair. Never-applicable (stale) actions are not
+        failing, they are waiting. Returns (name, meta) for the most recent, or None."""
         best = None
         for p in status.get("primitives") or []:
             name = p.get("name")
             meta = self.meta.get(name) or {}
-            if name not in self.registered or p.get("retired") or p.get("stale"):
+            if name not in self.registered or p.get("stale") or meta.get("final_retired"):
                 continue
-            if meta.get("subtask_id") != subtask_id or meta.get("repaired_by"):
+            if meta.get("subtask_id") != subtask_id:
                 continue
             if int(p.get("trials") or 0) >= 2 and int(p.get("successes") or 0) == 0:
                 if best is None or float(meta.get("created_at") or 0) > float(best[1].get("created_at") or 0):
                     best = (name, meta)
         return best
+
+    def _give_up_on(self, name: str, status: dict[str, Any]) -> str | None:
+        """The repair budget is spent. Restore the best earlier version if one ever
+        succeeded (returns its name); otherwise retire the action for good so its kind is
+        designed afresh (returns None)."""
+        meta = self.meta.setdefault(name, {})
+        good = [v for v in meta.get("versions") or [] if int(v.get("successes") or 0) > 0 and v.get("path")]
+        if good:
+            best = max(good, key=lambda v: (int(v["successes"]), int(v["successes"]) / max(1, int(v.get("trials") or 1))))
+            try:
+                with open(best["path"], encoding="utf-8") as fh:
+                    source = fh.read()
+                res = self.bridge.agent_primitive(name, source, purpose=meta.get("subtask"), repair=True, version=best["version"])
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            if res.get("ok"):
+                self.registered[name] = source
+                with open(os.path.join(self.dir, f"{name}.js"), "w", encoding="utf-8") as fh:
+                    fh.write(source)
+                meta.update({"version": best["version"], "restored_from": best["version"], "trials": 0, "successes": 0,
+                             "failures": 0, "retired": False, "base": {"trials": 0, "successes": 0, "failures": 0}})
+                self._save_sidecar(name)
+                self._say(f"repair budget spent for x:{name}; restored version {best['version']} "
+                          f"({best['successes']}/{best.get('trials')} successes)")
+                self._log("action_restored", {"name": name, "version": best["version"]})
+                return name
+        meta["final_retired"] = True
+        meta["retired"] = True
+        self._save_sidecar(name)
+        self._say(f"repair budget spent for x:{name} ({meta.get('version')} versions, none succeeded); retired for good")
+        self._log("action_given_up", {"name": name, "versions": meta.get("versions"), "kind": meta.get("kind"), "target": meta.get("target")})
+        return None
 
     def _evict_weakest(self, status: dict[str, Any], subtask_id: str | None) -> str | None:
         """Retire one generated action to make room on a full menu. Returns its name.
@@ -730,25 +921,38 @@ class ActionBuilder:
         return fresh
 
     def _open_kinds(self, subtask_id: str | None = None) -> dict[str, str]:
-        """Kinds not yet covered by a live generated action that has succeeded at least once.
+        """Kinds Jev may choose for this subtask.
 
-        Without this, Jev keeps designing another 'mine' action while the real gap
-        is picking up the drop or crafting, and the builder rewrites the same action.
+        Every kind stays open except, for this subtask only, kinds whose action was
+        never applicable (stale) or was retired for good after its repair budget. An
+        earlier version also removed any kind that had a proven action anywhere and any
+        kind already tried here; that hid `mine` from the cobblestone step because a log
+        miner existed, and Jev was left choosing between wrong kinds (F2). Duplicates are
+        now prevented by repairing the existing action instead.
         """
-        covered = set()
-        for name, meta in self.meta.items():
-            if name in self.registered and meta.get("successes", 0) > 0 and not meta.get("retired"):
-                covered.add(meta.get("kind"))
-        covered |= self.stale_kinds.get(subtask_id or "", set())
-        # every kind already built for this subtask counts as tried, whether the
-        # action succeeded, failed, retired or was never offered: the next design
-        # must try something different
+        closed = set(self.stale_kinds.get(subtask_id or "", set()))
         if subtask_id is not None:
             for meta in self.meta.values():
-                if meta.get("subtask_id") == subtask_id and meta.get("kind"):
-                    covered.add(meta["kind"])
-        open_kinds = {k: v for k, v in KINDS.items() if k not in covered or k == "other"}
+                if meta.get("subtask_id") == subtask_id and meta.get("final_retired") and meta.get("kind"):
+                    closed.add(meta["kind"])
+        open_kinds = {k: v for k, v in KINDS.items() if k not in closed or k == "other"}
         return open_kinds if len(open_kinds) > 1 else dict(KINDS)
+
+    def _learned_by_kind(self, menu: dict[str, str]) -> dict[str, list[str]]:
+        """For the design question: the actions the bot already has, by kind, with their
+        record and whether the menu offers them right now."""
+        out: dict[str, list[str]] = {}
+        stats = {p.get("name"): p for p in ((getattr(self, "_status", None) or {}).get("primitives") or [])}
+        for name, meta in self.meta.items():
+            if name not in self.registered or meta.get("final_retired"):
+                continue
+            p = stats.get(name) or {}
+            trials = int((meta.get("base") or {}).get("trials", 0)) + int(p.get("trials") or 0)
+            wins = int((meta.get("base") or {}).get("successes", 0)) + int(p.get("successes") or 0)
+            where = "offered on the menu now" if f"x:{name}" in (menu or {}) else "NOT offered now (its condition does not hold here)"
+            what = meta.get("purpose") or meta.get("learned_from") or meta.get("subtask") or ""
+            out.setdefault(meta.get("kind") or "other", []).append(f"x:{name}: {what} ({wins}/{trials} successes; {where})")
+        return out
 
     def _design(self, subtask, snap, recent, menu, tree_items) -> tuple[str, str]:
         """Jev picks the kind of action and its target. Falls back to ('other', 'none')."""
@@ -774,6 +978,7 @@ class ActionBuilder:
             "nearby_blocks": snap.get("blocks") or {},
             "nearby_entities": snap.get("entities") or [],
             "tree_items": tree_items,
+            "learned_actions": self._learned_by_kind(menu),
         }
         response = self.jev.ask(
             "builder_design",
@@ -784,7 +989,11 @@ class ActionBuilder:
                         "A Minecraft bot cannot finish `subtask` with the actions in `menu` (each key is an "
                         "action id, each value says what it does). `recent_actions` shows what it tried. "
                         "Which KIND of action is missing from the menu and would let it make progress? "
-                        "Pick the kind whose description matches the first thing the bot cannot do yet."
+                        "Pick the kind whose description matches the first thing the bot cannot do yet. "
+                        "`learned_actions` lists, by kind, the actions the bot already has and whether the menu "
+                        "offers each one right now. When the needed kind already has an action that is not "
+                        "offered now, what is missing is whatever makes it applicable (getting within reach, a "
+                        "tool, a free spot), so pick the kind that provides that."
                     ),
                     criteria=self._open_kinds(subtask.get("id")),
                 ),
@@ -830,6 +1039,7 @@ class ActionBuilder:
             f"Outcome tallies by action: {outcomes_by_action(recent)}\n"
             f"Generated actions already registered: {sorted(self.registered)}\n\n"
             + self._attempt_history(subtask)
+            + self._experience_block(subtask)
             + "Design ONE new action of that kind that the bot can pick from its menu. It must do something "
             "no current menu entry does. Do not re-implement an existing registered action.\n\n"
             + CONTRACT
@@ -837,6 +1047,73 @@ class ActionBuilder:
             + catalog.describe_catalog() + "\n"
             + "\nExample of the expected style:\n"
             + EXAMPLE
+        )
+
+    def _experience_block(self, subtask: dict[str, Any], failure_labels: list[str] | None = None) -> str:
+        """Raw evidence and lessons from earlier play, labelled as guidance:
+        * the single closest completed trace of a similar step (raw action records);
+        * the lesson file for this step's family and the remedies that match it, when the
+          post-goal review has written any. Raw traces stay the source of truth."""
+        parts = []
+        try:
+            prior = self.traces.most_similar(str(subtask.get("description") or ""), subtask.get("kind"))
+        except Exception:
+            prior = None
+        if prior:
+            parts.append(
+                f"A PREVIOUS COMPLETED ATTEMPT AT A SIMILAR STEP ('{prior.get('description')}', "
+                f"{prior.get('actions')} actions). These are raw records of what the bot did and what happened; "
+                "use them as evidence of what works, not as a script:\n" + render_trace(prior.get("records") or [], limit=25)
+            )
+        if self.lessons is not None:
+            try:
+                text = self.lessons.for_builder(family_of(subtask.get("kind")), failure_labels or [])
+            except Exception:
+                text = ""
+            if text:
+                parts.append(text)
+        return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+    def _repair_prompt(self, subtask, snap, menu, tree_items, name: str, meta: dict[str, Any], prim: dict[str, Any], reason: str) -> str:
+        """Everything a local fix needs: the full source, every outcome of this version with
+        its typed label and decision-record id, what the labels usually mean, earlier
+        versions' results, and the situation now."""
+        source = self.registered.get(name, "")
+        log = prim.get("outcome_log") or [{"ok": False, "label": None, "outcome": o, "id": None} for o in prim.get("last_outcomes") or []]
+        lines = []
+        for o in log:
+            tag = o.get("label") or ("OK" if o.get("ok") else "FAILED")
+            lines.append(f"- [{tag}] {o.get('outcome')}" + (f" {{{o.get('id')}}}" if o.get("id") else ""))
+        labels = collections.Counter(o.get("label") for o in log if o.get("label") and not o.get("ok"))
+        hints = "\n".join(f"- {lab} x{n}: {LABEL_HINTS.get(lab, '')}" for lab, n in labels.most_common())
+        versions = "\n".join(
+            f"- v{v.get('version')}: {v.get('successes', 0)}/{v.get('trials', 0)} successes; labels {v.get('labels') or {}}"
+            for v in meta.get("versions") or []
+        )
+        version = int(meta.get("version") or 1)
+        return (
+            f"REPAIR the existing action x:{name} (version {version}; kind {meta.get('kind')}; target {meta.get('target')}).\n"
+            f"It was written for the step: {subtask.get('description')}\n"
+            + self._gap_line(subtask, snap)
+            + f"That step's completion check (a VerifySpec): {json.dumps(subtask.get('verify'))}\n"
+            f"Its declared purpose: {meta.get('purpose') or 'none'} (achieves {json.dumps(meta.get('purpose_spec'))})\n\n"
+            f"Its full source (version {version}):\n```javascript\n{source[:9000]}\n```\n\n"
+            "What happened each time this version ran, oldest first ([label] outcome {decision-record id}):\n"
+            + ("\n".join(lines) or "- (no outcomes recorded)") + "\n\n"
+            + (f"What those failure labels usually mean:\n{hints}\n\n" if hints else "")
+            + (f"Earlier versions of this action:\n{versions}\n\n" if versions else "")
+            + f"Current menu (id -> what it does): {json.dumps(menu)[:1200]}\n"
+            f"Snapshot now: {json.dumps(snap)[:2000]}\n"
+            f"Items in the goal tree: {tree_items}\n"
+            + (f"Note from the caller: {reason}\n" if reason else "")
+            + "\n"
+            + self._experience_block(subtask, list(labels))
+            + f"Find the root cause in the code from the evidence above and make the SMALLEST change that fixes it. "
+            f"Keep the action's name (`// name: {name}`), its job and its PURPOSE unless the evidence shows the "
+            "PURPOSE itself is wrong. Answer with the full corrected module.\n\n"
+            + CONTRACT
+            + "\nPURPOSE PREDICATES (for PURPOSE.achieves; '*_log' style family names are allowed):\n"
+            + catalog.describe_catalog() + "\n"
         )
 
     @staticmethod
@@ -937,11 +1214,24 @@ class ActionBuilder:
             "an action that avoids it:" + nl + nl.join(blocks[-4:]) + nl
         )
 
-    def _write_and_register(self, subtask, snap, recent, menu, tree_items, kind, target, reason) -> str | None:
+    def _write_and_register(self, subtask, snap, recent, menu, tree_items, kind, target, reason, *, repair_of: str | None = None) -> str | None:
+        """Ask GPT for a module, check it, register it, persist it. With ``repair_of`` the
+        draft is a new version of that action: it keeps the name, compiles under a
+        temporary draft name until it passes every check (so a rejected draft never
+        clobbers the registered one), then replaces it with fresh trial counts."""
         if self.llm is None:
             self._say("builder: no LLM handle; cannot write an action")
+            self.last_refusal = "no LLM handle; cannot write an action"
+            self._log("build_failed", {"subtask": subtask.get("description"), "why": self.last_refusal})
             return None
-        prompt = self._prompt(subtask, snap, recent, menu, tree_items, kind, target, reason)
+        prim = {}
+        if repair_of is not None:
+            prim = next((p for p in (getattr(self, "_status", None) or {}).get("primitives") or [] if p.get("name") == repair_of), {})
+            prompt = self._repair_prompt(subtask, snap, menu, tree_items, repair_of, self.meta.get(repair_of) or {}, prim, reason)
+            self._say(f"repairing x:{repair_of} (v{int((self.meta.get(repair_of) or {}).get('version') or 1)}, {kind} for {target}) "
+                      f"for '{subtask.get('description')}'")
+        else:
+            prompt = self._prompt(subtask, snap, recent, menu, tree_items, kind, target, reason)
         messages = [
             {"role": "system", "content": "You write small, careful mineflayer primitives."},
             {"role": "user", "content": prompt},
@@ -953,10 +1243,12 @@ class ActionBuilder:
                     {"role": "user", "content": f"The previous module was rejected: {error_feedback}. Fix it and answer with the full module again."}
                 )
             try:
-                reply = self.llm.complete(messages)
+                with timing.timed("llm.builder", attempt=attempt, kind=kind):
+                    reply = self.llm.complete(messages)
             except Exception as exc:
                 self._say(f"builder: GPT call failed: {exc}")
-                self.last_refusal = f"GPT call failed: {exc}"
+                self.last_refusal = f"GPT call failed: {type(exc).__name__}: {exc}"[:300]
+                self._log("build_failed", {"subtask": subtask.get("description"), "why": self.last_refusal})
                 return None
             if hasattr(reply, "content"):
                 reply = reply.content
@@ -964,10 +1256,13 @@ class ActionBuilder:
             if not source:
                 error_feedback = "no code block found"
                 continue
-            if not name:
-                base = re.sub(r"[^a-z0-9_]", "_", f"{kind}_{target}".lower()).strip("_")[:28] or "action"
-                name = f"gen_{base}"[:32]
-            name = self._unique_name(name)
+            if repair_of is not None:
+                name = f"{repair_of[:26]}_draft"  # checked under a draft name; the real one is untouched
+            else:
+                if not name:
+                    base = re.sub(r"[^a-z0-9_]", "_", f"{kind}_{target}".lower()).strip("_")[:28] or "action"
+                    name = f"gen_{base}"[:32]
+                name = self._unique_name(name)
             err = static_check(name, source)
             if not err:
                 err = self._craft_target_problem(subtask, source)
@@ -984,6 +1279,8 @@ class ActionBuilder:
                 res = self.bridge.agent_primitive(name, source)
             except Exception as exc:
                 self._say(f"builder: could not post '{name}': {exc}")
+                self.last_refusal = f"could not post '{name}' to the bot: {type(exc).__name__}: {exc}"[:300]
+                self._log("build_failed", {"subtask": subtask.get("description"), "name": name, "why": self.last_refusal})
                 return None
             if res.get("ok") and res.get("purpose_holds_now") is True and attempt < self.max_attempts - 1:
                 try:
@@ -1014,9 +1311,14 @@ class ActionBuilder:
                     self.jev.log_only("action_rejected", {"name": name, "why": "not applicable now", "probe": res.get("probe"), "menu_error": res.get("menu_error"), "source": source})
                 self._say(f"builder: '{name}' compiled but is not applicable right now; asking for a revision")
                 continue
+            if res.get("ok") and repair_of is not None:
+                return self._accept_repair(repair_of, name, source, subtask, prim, reason)
             if res.get("ok"):
                 self.registered[name] = source
                 self.meta[name] = {
+                    "version": 1,
+                    "versions": [],
+                    "model": self.model_name,
                     "purpose": res.get("purpose"),
                     "purpose_spec": res.get("purpose_spec"),
                     "kind": kind,
@@ -1035,7 +1337,8 @@ class ActionBuilder:
                 self._save_sidecar(name)
                 self.builds += 1
                 if self.jev is not None and hasattr(self.jev, "log_only"):
-                    self.jev.log_only("action_generated", {"name": name, "kind": kind, "target": target, "subtask": subtask.get("description"), "source": source})
+                    self.jev.log_only("action_generated", {"name": name, "kind": kind, "target": target, "subtask": subtask.get("description"),
+                                                           "model": self.model_name, "version": 1, "source": source})
                 self._say(f"new action x:{name} registered for '{subtask.get('description')}' (saved to {self.dir}); it is on the menu as a trial")
                 return name
             error_feedback = res.get("error") or "rejected by the bot process"
@@ -1047,6 +1350,59 @@ class ActionBuilder:
         self.last_refusal = f"all {self.max_attempts} GPT drafts rejected; last: {str(error_feedback)[:160]}"
         return None
 
+    def _accept_repair(self, name: str, draft: str, source: str, subtask: dict[str, Any], prim: dict[str, Any], reason: str) -> str | None:
+        """A repair draft passed every check: archive the current version with its record,
+        register the new source over the real name with fresh counts, and persist it."""
+        try:
+            self.bridge.agent_primitive_remove(draft)
+        except Exception:
+            pass
+        meta = self.meta.setdefault(name, {})
+        old_version = int(meta.get("version") or 1)
+        new_version = old_version + 1
+        try:
+            res = self.bridge.agent_primitive(name, source, purpose=subtask.get("description"), repair=True, version=new_version)
+        except Exception as exc:
+            self.last_refusal = f"could not register repaired x:{name}: {type(exc).__name__}: {exc}"[:300]
+            self._log("build_failed", {"subtask": subtask.get("description"), "name": name, "why": self.last_refusal})
+            return None
+        if not res.get("ok"):
+            self.last_refusal = f"repaired x:{name} compiled as a draft but Node rejected it: {res.get('error')}"[:300]
+            self._log("build_failed", {"subtask": subtask.get("description"), "name": name, "why": self.last_refusal})
+            return None
+        os.makedirs(self.versions_dir, exist_ok=True)
+        old_path = os.path.join(self.versions_dir, f"{name}.v{old_version}.js")
+        with open(old_path, "w", encoding="utf-8") as fh:
+            fh.write(self.registered.get(name, ""))
+        log = prim.get("outcome_log") or []
+        labels = dict(collections.Counter(o.get("label") for o in log if o.get("label") and not o.get("ok")))
+        base = meta.get("base") or {}
+        meta.setdefault("versions", []).append({
+            "version": old_version,
+            "path": old_path,
+            "trials": int(base.get("trials", 0)) + int(prim.get("trials") or 0),
+            "successes": int(base.get("successes", 0)) + int(prim.get("successes") or 0),
+            "failures": int(base.get("failures", 0)) + int(prim.get("failures") or 0),
+            "labels": labels,
+            "evidence": [o.get("id") for o in log if o.get("id")],
+            "model": meta.get("model"),
+        })
+        meta.update({
+            "version": new_version, "trials": 0, "successes": 0, "failures": 0, "retired": False,
+            "base": {"trials": 0, "successes": 0, "failures": 0}, "created_at": time.time(),
+            "purpose": res.get("purpose") or meta.get("purpose"), "purpose_spec": res.get("purpose_spec") or meta.get("purpose_spec"),
+            "model": self.model_name, "repair_reason": reason or None,
+        })
+        self.registered[name] = source
+        with open(os.path.join(self.dir, f"{name}.js"), "w", encoding="utf-8") as fh:
+            fh.write(source)
+        self._save_sidecar(name)
+        self.builds += 1
+        self._log("action_repaired", {"name": name, "version": new_version, "labels": labels, "subtask": subtask.get("description"),
+                                      "model": self.model_name, "source": source})
+        self._say(f"repaired x:{name}: version {new_version} replaces v{old_version} (failures {labels or 'unlabelled'})")
+        return name
+
     # ------------------------------------------------------------------ #
 
     def _save_sidecar(self, name: str) -> None:
@@ -1055,6 +1411,14 @@ class ActionBuilder:
                 json.dump(self.meta.get(name, {}), fh, indent=2)
         except Exception as exc:
             self._say(f"builder: sidecar write failed for {name}: {exc}")
+
+    def _log(self, gate: str, record: dict[str, Any]) -> None:
+        """Append an audit record through the Jev client's jsonl log (no-op without one)."""
+        if self.jev is not None and hasattr(self.jev, "log_only"):
+            try:
+                self.jev.log_only(gate, record)
+            except Exception:
+                pass
 
     def _say(self, text: str) -> None:
         self.log.append(text)
