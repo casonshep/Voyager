@@ -88,7 +88,7 @@ class MinecraftInstance:
 
             login_data = minecraft_launcher_lib.microsoft_account.complete_login(
                 self.client_id,
-                self.secret_value,
+                # self.secret_value,
                 self.redirect_url,
                 auth_code,
                 code_verifier,

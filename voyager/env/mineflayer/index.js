@@ -1,10 +1,23 @@
-const fs = require("fs");
+// Bot process: one mineflayer bot behind a small HTTP server (PLAN.md section 7).
+//
+//   POST /start          spawn the bot (body: port, username, waitTicks, reset, position, spread)
+//   POST /reset          in-process cleanup between goals
+//   GET  /knowledge      recipes, harvest tools and knowledge tables (works before /start)
+//   POST /agent/subtask  set the subtask the Jev loop works on
+//   GET  /agent/status   snapshot, drained triggers, recent actions, primitives, menu
+//   POST /agent/verify   evaluate a VerifySpec now
+//   POST /agent/primitive register a generated action (or remove one)
+//   POST /agent/stop     idle the loop
+//   POST /stop, /pause
+//
+//   node index.js [port] [--fake-world]     FAKE_WORLD=1 also works: no Minecraft,
+//                                           the canned plains bot from scripts/fakeWorld.js
 const express = require("express");
 const bodyParser = require("body-parser");
 const mineflayer = require("mineflayer");
 
-const skills = require("./lib/skillLoader");
-const { initCounter, getNextTime } = require("./lib/utils");
+const { cleanupBot } = require("./lib/botCleanup");
+const observeLib = require("./lib/observe");
 const obs = require("./lib/observation/base");
 const OnChat = require("./lib/observation/onChat");
 const OnError = require("./lib/observation/onError");
@@ -13,126 +26,145 @@ const Status = require("./lib/observation/status");
 const Inventory = require("./lib/observation/inventory");
 const OnSave = require("./lib/observation/onSave");
 const Chests = require("./lib/observation/chests");
-const { plugin: tool } = require("mineflayer-tool");
+const agentLoop = require("./lib/agentLoop");
+const knowledge = require("./lib/knowledge");
+
+const args = process.argv.slice(2);
+const FAKE_WORLD = process.env.FAKE_WORLD === "1" || args.includes("--fake-world");
+const PORT = Number(args.find((a) => /^\d+$/.test(a))) || 3000;
 
 let bot = null;
+let lastDisconnect = null; // why the bot's connection ended, until the next /start
 
 const app = express();
-
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb", extended: false }));
 
+// A throw inside a packet handler or a timer callback would otherwise end the
+// process (the signed-chat crash did exactly that). Log it and keep the bot.
+process.on("uncaughtException", (err) => {
+    console.log("uncaughtException (bot kept alive):", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (err) => {
+    console.log("unhandledRejection (ignored):", err && err.stack ? err.stack : err);
+});
+
+function errorText(err) {
+    return String(err && err.message ? err.message : err);
+}
+
+function requireLoop(res) {
+    if (!bot || !bot.entity || !bot.agentLoop) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return null;
+    }
+    return bot.agentLoop;
+}
+
+if (FAKE_WORLD) {
+    const { makeFakeBot } = require("./scripts/fakeWorld");
+    bot = makeFakeBot(process.env.MC_VERSION || "1.19").bot;
+    agentLoop.inject(bot);
+    bot.observe = () => ({ fake: true });
+    console.log("FAKE_WORLD: serving the canned plains bot; /start is a no-op");
+}
+
 app.post("/start", (req, res) => {
+    if (FAKE_WORLD) {
+        res.json({ fake: true, position: bot.entity.position });
+        return;
+    }
+    lastDisconnect = null;
     if (bot) onDisconnect("Restarting bot");
     bot = null;
     console.log(req.body);
     bot = mineflayer.createBot({
-        host: "localhost", // minecraft server ip
-        port: req.body.port, // minecraft server port
-        username: "bot",
+        host: "localhost",
+        port: req.body.port,
+        username: req.body.username || "bot",
         disableChatSigning: true,
         checkTimeoutInterval: 60 * 60 * 1000,
     });
     bot.once("error", onConnectionFailed);
 
-    // Event subscriptions
-    bot.waitTicks = req.body.waitTicks;
-    bot.globalTickCounter = 0;
-    bot.stuckTickCounter = 0;
-    bot.stuckPosList = [];
-    bot.iron_pickaxe = false;
-
+    bot.waitTicks = req.body.waitTicks || 5;
     bot.on("kicked", onDisconnect);
-
-    // mounting will cause physicsTick to stop
-    bot.on("mount", () => {
-        bot.dismount();
+    // A connection the server drops without a kick (ECONNRESET) only fires "end".
+    // Stop the loop so it does not keep deciding against a dead socket, and remember
+    // why so /agent/status can tell Python to reconnect.
+    bot.once("end", (reason) => {
+        lastDisconnect = String(reason || "connection ended");
+        console.log(`bot disconnected: ${lastDisconnect}`);
+        try {
+            if (bot && bot.agentLoop) bot.agentLoop.stop().catch(() => {});
+        } catch (err) {
+            /* already gone */
+        }
+        bot = null;
     });
+    bot.on("mount", () => bot.dismount()); // mounting stops physicsTick
 
     bot.once("spawn", async () => {
+        try {
+            await onSpawn();
+        } catch (err) {
+            // Never leave /start unanswered: Python waits on it for minutes.
+            console.log("spawn setup failed:", err && err.stack ? err.stack : err);
+            if (!res.headersSent) res.status(500).json({ error: `spawn setup failed: ${errorText(err)}` });
+        }
+    });
+
+    async function onSpawn() {
         bot.removeListener("error", onConnectionFailed);
         let itemTicks = 1;
         if (req.body.reset === "hard") {
             bot.chat("/clear @s");
             bot.chat("/kill @s");
-            const inventory = req.body.inventory ? req.body.inventory : {};
-            const equipment = req.body.equipment
-                ? req.body.equipment
-                : [null, null, null, null, null, null];
-            for (let key in inventory) {
+            const inventory = req.body.inventory || {};
+            const equipment = req.body.equipment || [null, null, null, null, null, null];
+            for (const key in inventory) {
                 bot.chat(`/give @s minecraft:${key} ${inventory[key]}`);
                 itemTicks += 1;
             }
-            const equipmentNames = [
-                "armor.head",
-                "armor.chest",
-                "armor.legs",
-                "armor.feet",
-                "weapon.mainhand",
-                "weapon.offhand",
-            ];
+            const equipmentNames = ["armor.head", "armor.chest", "armor.legs", "armor.feet", "weapon.mainhand", "weapon.offhand"];
             for (let i = 0; i < 6; i++) {
                 if (i === 4) continue;
                 if (equipment[i]) {
-                    bot.chat(
-                        `/item replace entity @s ${equipmentNames[i]} with minecraft:${equipment[i]}`
-                    );
+                    bot.chat(`/item replace entity @s ${equipmentNames[i]} with minecraft:${equipment[i]}`);
                     itemTicks += 1;
                 }
             }
         }
-
         if (req.body.position) {
-            bot.chat(
-                `/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`
-            );
+            bot.chat(`/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`);
         }
 
-        // if iron_pickaxe is in bot's inventory
-        if (
-            bot.inventory.items().find((item) => item.name === "iron_pickaxe")
-        ) {
-            bot.iron_pickaxe = true;
-        }
-
-        const { pathfinder } = require("mineflayer-pathfinder");
-        const tool = require("mineflayer-tool").plugin;
-        const collectBlock = require("mineflayer-collectblock").plugin;
-        const pvp = require("mineflayer-pvp").plugin;
-        const minecraftHawkEye = require("minecrafthawkeye");
+        const { pathfinder, Movements } = require("mineflayer-pathfinder");
         bot.loadPlugin(pathfinder);
-        bot.loadPlugin(tool);
-        bot.loadPlugin(collectBlock);
-        bot.loadPlugin(pvp);
-        bot.loadPlugin(minecraftHawkEye);
+        bot.loadPlugin(require("mineflayer-tool").plugin);
+        bot.loadPlugin(require("mineflayer-collectblock").plugin);
+        bot.loadPlugin(require("mineflayer-pvp").plugin);
+        try {
+            // generated primitives may use bot.pathfinder.goto; give it sane defaults
+            const movements = new Movements(bot, require("minecraft-data")(bot.version));
+            movements.canDig = false;
+            bot.pathfinder.setMovements(movements);
+        } catch (err) {
+            console.log("pathfinder movements not set:", errorText(err));
+        }
 
-        // bot.collectBlock.movements.digCost = 0;
-        // bot.collectBlock.movements.placeCost = 0;
-
-        obs.inject(bot, [
-            OnChat,
-            OnError,
-            Voxels,
-            Status,
-            Inventory,
-            OnSave,
-            Chests,
-            BlockRecords,
-        ]);
-        skills.inject(bot);
+        agentLoop.inject(bot);
+        obs.inject(bot, [OnChat, OnError, Voxels, Status, Inventory, OnSave, Chests, BlockRecords]);
 
         if (req.body.spread) {
             bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
             await bot.waitForTicks(bot.waitTicks);
         }
-
         await bot.waitForTicks(bot.waitTicks * itemTicks);
         res.json(bot.observe());
-
-        initCounter(bot);
         bot.chat("/gamerule keepInventory true");
         bot.chat("/gamerule doDaylightCycle false");
-    });
+    }
 
     function onConnectionFailed(e) {
         console.log(e);
@@ -140,269 +172,195 @@ app.post("/start", (req, res) => {
         res.status(400).json({ error: e });
     }
     function onDisconnect(message) {
-        if (bot.viewer) {
-            bot.viewer.close();
-        }
+        if (bot.viewer) bot.viewer.close();
+        if (bot.agentLoop) bot.agentLoop.stop().catch(() => {});
         bot.end();
         console.log(message);
         bot = null;
     }
 });
 
-app.post("/step", async (req, res) => {
-    // import useful package
-    let response_sent = false;
-    function otherError(err) {
-        console.log("Uncaught Error");
-        bot.emit("error", handleError(err));
-        bot.waitForTicks(bot.waitTicks).then(() => {
-            if (!response_sent) {
-                response_sent = true;
-                res.json(bot.observe());
-            }
-        });
+// In-process reset between goals: stop the loop, clear what actions may have
+// left running, optionally teleport. Returns an observation like /start.
+app.post("/reset", async (req, res) => {
+    if (!bot || !bot.entity) {
+        res.status(400).json({ error: "Bot not spawned" });
+        return;
     }
-
-    process.on("uncaughtException", otherError);
-
-    const mcData = require("minecraft-data")(bot.version);
-    mcData.itemsByName["leather_cap"] = mcData.itemsByName["leather_helmet"];
-    mcData.itemsByName["leather_tunic"] =
-        mcData.itemsByName["leather_chestplate"];
-    mcData.itemsByName["leather_pants"] =
-        mcData.itemsByName["leather_leggings"];
-    mcData.itemsByName["leather_boots"] = mcData.itemsByName["leather_boots"];
-    mcData.itemsByName["lapis_lazuli_ore"] = mcData.itemsByName["lapis_ore"];
-    mcData.blocksByName["lapis_lazuli_ore"] = mcData.blocksByName["lapis_ore"];
-    const {
-        Movements,
-        goals: {
-            Goal,
-            GoalBlock,
-            GoalNear,
-            GoalXZ,
-            GoalNearXZ,
-            GoalY,
-            GoalGetToBlock,
-            GoalLookAtBlock,
-            GoalBreakBlock,
-            GoalCompositeAny,
-            GoalCompositeAll,
-            GoalInvert,
-            GoalFollow,
-            GoalPlaceBlock,
-        },
-        pathfinder,
-        Move,
-        ComputedPath,
-        PartiallyComputedPath,
-        XZCoordinates,
-        XYZCoordinates,
-        SafeBlock,
-        GoalPlaceBlockOptions,
-    } = require("mineflayer-pathfinder");
-    const { Vec3 } = require("vec3");
-
-    // Set up pathfinder
-    const movements = new Movements(bot, mcData);
-    bot.pathfinder.setMovements(movements);
-
-    bot.globalTickCounter = 0;
-    bot.stuckTickCounter = 0;
-    bot.stuckPosList = [];
-
-    function onTick() {
-        bot.globalTickCounter++;
-        if (bot.pathfinder.isMoving()) {
-            bot.stuckTickCounter++;
-            if (bot.stuckTickCounter >= 100) {
-                onStuck(1.5);
-                bot.stuckTickCounter = 0;
+    try {
+        if (bot.agentLoop) await bot.agentLoop.stop();
+        if (!FAKE_WORLD) {
+            bot.waitTicks = req.body.waitTicks || bot.waitTicks;
+            await cleanupBot(bot);
+            if (req.body.position) {
+                bot.chat(`/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`);
             }
+            if (req.body.spread) {
+                bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
+                await bot.waitForTicks(bot.waitTicks);
+            }
+            await bot.waitForTicks(bot.waitTicks);
         }
-    }
-
-    bot.on("physicTick", onTick);
-
-    // initialize fail count
-    let _craftItemFailCount = 0;
-    let _killMobFailCount = 0;
-    let _mineBlockFailCount = 0;
-    let _placeItemFailCount = 0;
-    let _smeltItemFailCount = 0;
-
-    // Retrieve array form post bod
-    const code = req.body.code;
-    const programs = req.body.programs;
-    bot.cumulativeObs = [];
-    await bot.waitForTicks(bot.waitTicks);
-    const r = await evaluateCode(code, programs);
-    process.off("uncaughtException", otherError);
-    if (r !== "success") {
-        bot.emit("error", handleError(r));
-    }
-    await returnItems();
-    // wait for last message
-    await bot.waitForTicks(bot.waitTicks);
-    if (!response_sent) {
-        response_sent = true;
         res.json(bot.observe());
+    } catch (err) {
+        console.log("reset failed:", err);
+        res.status(500).json({ error: errorText(err) });
     }
-    bot.removeListener("physicTick", onTick);
+});
 
-    async function evaluateCode(code, programs) {
-        // Echo the code produced for players to see it. Don't echo when the bot code is already producing dialog or it will double echo
+// ---------------------------------------------------------------------------
+// Knowledge: recipes and tables for the decomposer. Works before /start.
+// ---------------------------------------------------------------------------
+app.get("/knowledge", (req, res) => {
+    try {
+        const version = req.query.version || (bot && bot.version) || process.env.MC_VERSION || "1.19";
+        res.json(knowledge.build(version));
+    } catch (err) {
+        res.status(500).json({ error: errorText(err) });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Agent loop endpoints (lib/agentLoop.js)
+// ---------------------------------------------------------------------------
+app.post("/agent/subtask", async (req, res) => {
+    const loop = requireLoop(res);
+    if (!loop) return;
+    try {
+        const result = await loop.setSubtask(req.body || {});
+        if (!result.ok) res.status(400).json(result);
+        else res.json(result);
+    } catch (err) {
+        console.log("agent/subtask failed:", err);
+        res.status(500).json({ ok: false, error: errorText(err) });
+    }
+});
+
+app.get("/agent/status", (req, res) => {
+    if (!bot && lastDisconnect) {
+        res.json({ disconnected: true, reason: lastDisconnect });
+        return;
+    }
+    const loop = requireLoop(res);
+    if (!loop) return;
+    try {
+        const drain = req.query.drain !== "0";
+        res.json(loop.status({ drain }));
+    } catch (err) {
+        console.log("agent/status failed:", err);
+        res.status(500).json({ error: errorText(err) });
+    }
+});
+
+app.post("/agent/verify", async (req, res) => {
+    const loop = requireLoop(res);
+    if (!loop) return;
+    try {
+        const spec = (req.body || {}).spec;
+        res.json(await loop.verifySpec(spec));
+    } catch (err) {
+        res.status(500).json({ ok: false, detail: errorText(err) });
+    }
+});
+
+// Register (or replace, or remove with {remove:true}) a runtime action.
+// Returns the exact compile or check error so the builder can retry with it.
+app.post("/agent/primitive", async (req, res) => {
+    const loop = requireLoop(res);
+    if (!loop) return;
+    const b = req.body || {};
+    if (b.remove) {
+        res.json({ ok: loop.registry.remove(String(b.name || "")), error: null });
+        return;
+    }
+    let snap = null;
+    try {
+        snap = loop.snapshot();
+    } catch (err) {
+        snap = null;
+    }
+    const name = String(b.name || "");
+    // menu() is smoke-tested against the current snapshot only while a subtask is
+    // active: before one is posted (reloading the library at startup) snap.subtask is
+    // null, and a correct action that reads its progress would be wrongly rejected.
+    const smokeSnap = loop.subtask ? snap : null;
+    const result = loop.registry.register(name, String(b.source || ""), smokeSnap, b.purpose ? String(b.purpose) : null, {
+        repair: Boolean(b.repair),
+        version: b.version,
+    });
+    if (result.ok && b.repaired) loop.registry.markRepaired(name);
+    // Applicability check: would menu() offer this action in the world as it is now?
+    // An action that is never offered can never be tried, so the builder needs to know
+    // at compile time, not after a wasted trial.
+    let offeredNow = null;
+    let menuLine = null;
+    let menuError = null;
+    if (result.ok && smokeSnap) {
+        const p = loop.registry.get(name);
         try {
-            await eval("(async () => {" + programs + "\n" + code + "})()");
-            return "success";
+            const line = p.menu(snap, loop);
+            offeredNow = typeof line === "string" && line.trim().length > 0;
+            menuLine = offeredNow ? line.trim().slice(0, 300) : null;
         } catch (err) {
-            return err;
+            offeredNow = false;
+            menuError = errorText(err);
         }
     }
-
-    function onStuck(posThreshold) {
-        const currentPos = bot.entity.position;
-        bot.stuckPosList.push(currentPos);
-
-        // Check if the list is full
-        if (bot.stuckPosList.length === 5) {
-            const oldestPos = bot.stuckPosList[0];
-            const posDifference = currentPos.distanceTo(oldestPos);
-
-            if (posDifference < posThreshold) {
-                teleportBot(); // execute the function
+    // Ground truth for the builder: what the helpers return for each target right now.
+    const probe = {};
+    if (snap) {
+        for (const key of Object.keys(snap.blocks || {})) {
+            try {
+                const found = loop.nearestBlocks(observeLib.matcherFor(key), 32, 1);
+                probe[key] = found.length
+                    ? `loop.nearestBlocks(loop.matcher("${key}"), 32, 1) -> ${found[0].name} at ${found[0].position.distanceTo(bot.entity.position).toFixed(1)} blocks`
+                    : `loop.nearestBlocks(loop.matcher("${key}"), 32, 1) -> []`;
+            } catch (err) {
+                probe[key] = `probe failed: ${errorText(err)}`;
             }
-
-            // Remove the oldest time from the list
-            bot.stuckPosList.shift();
         }
     }
-
-    function teleportBot() {
-        const blocks = bot.findBlocks({
-            matching: (block) => {
-                return block.type === 0;
-            },
-            maxDistance: 1,
-            count: 27,
-        });
-
-        if (blocks) {
-            // console.log(blocks.length);
-            const randomIndex = Math.floor(Math.random() * blocks.length);
-            const block = blocks[randomIndex];
-            bot.chat(`/tp @s ${block.x} ${block.y} ${block.z}`);
-        } else {
-            bot.chat("/tp @s ~ ~1.25 ~");
+    // Does the action's declared achievement already hold? Then the menu would hide it
+    // even though the subtask that asked for it is unfinished: the declaration is wrong.
+    let purposeHoldsNow = null;
+    const reg = result.ok ? loop.registry.get(name) : null;
+    if (reg && reg.purposeSpec) {
+        try {
+            purposeHoldsNow = Boolean((await loop.verifySpec(reg.purposeSpec)).ok);
+        } catch (err) {
+            purposeHoldsNow = null;
         }
     }
+    res.json({
+        ok: result.ok,
+        error: result.error || null,
+        purpose: reg ? reg.purpose : null,
+        purpose_spec: reg ? reg.purposeSpec : null,
+        purpose_holds_now: purposeHoldsNow,
+        probe,
+        offered_now: offeredNow,
+        menu_line: menuLine,
+        menu_error: menuError,
+        primitives: loop.registry.summary(),
+    });
+});
 
-    function returnItems() {
-        bot.chat("/gamerule doTileDrops false");
-        const crafting_table = bot.findBlock({
-            matching: mcData.blocksByName.crafting_table.id,
-            maxDistance: 128,
-        });
-        if (crafting_table) {
-            bot.chat(
-                `/setblock ${crafting_table.position.x} ${crafting_table.position.y} ${crafting_table.position.z} air destroy`
-            );
-            bot.chat("/give @s crafting_table");
-        }
-        const furnace = bot.findBlock({
-            matching: mcData.blocksByName.furnace.id,
-            maxDistance: 128,
-        });
-        if (furnace) {
-            bot.chat(
-                `/setblock ${furnace.position.x} ${furnace.position.y} ${furnace.position.z} air destroy`
-            );
-            bot.chat("/give @s furnace");
-        }
-        if (bot.inventoryUsed() >= 32) {
-            // if chest is not in bot's inventory
-            if (!bot.inventory.items().find((item) => item.name === "chest")) {
-                bot.chat("/give @s chest");
-            }
-        }
-        // if iron_pickaxe not in bot's inventory and bot.iron_pickaxe
-        if (
-            bot.iron_pickaxe &&
-            !bot.inventory.items().find((item) => item.name === "iron_pickaxe")
-        ) {
-            bot.chat("/give @s iron_pickaxe");
-        }
-        bot.chat("/gamerule doTileDrops true");
+app.post("/agent/stop", async (req, res) => {
+    if (!bot || !bot.agentLoop) {
+        res.json({ ok: true });
+        return;
     }
-
-    function handleError(err) {
-        let stack = err.stack;
-        if (!stack) {
-            return err;
-        }
-        console.log(stack);
-        const final_line = stack.split("\n")[1];
-        const regex = /<anonymous>:(\d+):\d+\)/;
-
-        const programs_length = programs.split("\n").length;
-        let match_line = null;
-        for (const line of stack.split("\n")) {
-            const match = regex.exec(line);
-            if (match) {
-                const line_num = parseInt(match[1]);
-                if (line_num >= programs_length) {
-                    match_line = line_num - programs_length;
-                    break;
-                }
-            }
-        }
-        if (!match_line) {
-            return err.message;
-        }
-        let f_line = final_line.match(
-            /\((?<file>.*):(?<line>\d+):(?<pos>\d+)\)/
-        );
-        if (f_line && f_line.groups && fs.existsSync(f_line.groups.file)) {
-            const { file, line, pos } = f_line.groups;
-            const f = fs.readFileSync(file, "utf8").split("\n");
-            // let filename = file.match(/(?<=node_modules\\)(.*)/)[1];
-            let source = file + `:${line}\n${f[line - 1].trim()}\n `;
-
-            const code_source =
-                "at " +
-                code.split("\n")[match_line - 1].trim() +
-                " in your code";
-            return source + err.message + "\n" + code_source;
-        } else if (
-            f_line &&
-            f_line.groups &&
-            f_line.groups.file.includes("<anonymous>")
-        ) {
-            const { file, line, pos } = f_line.groups;
-            let source =
-                "Your code" +
-                `:${match_line}\n${code.split("\n")[match_line - 1].trim()}\n `;
-            let code_source = "";
-            if (line < programs_length) {
-                source =
-                    "In your program code: " +
-                    programs.split("\n")[line - 1].trim() +
-                    "\n";
-                code_source = `at line ${match_line}:${code
-                    .split("\n")
-                    [match_line - 1].trim()} in your code`;
-            }
-            return source + err.message + "\n" + code_source;
-        }
-        return err.message;
+    try {
+        res.json(await bot.agentLoop.stop());
+    } catch (err) {
+        res.status(500).json({ ok: false, error: errorText(err) });
     }
 });
 
 app.post("/stop", (req, res) => {
-    bot.end();
-    res.json({
-        message: "Bot stopped",
-    });
+    if (bot && bot.agentLoop) bot.agentLoop.stop().catch(() => {});
+    if (bot && !FAKE_WORLD) bot.end();
+    res.json({ message: "Bot stopped" });
 });
 
 app.post("/pause", (req, res) => {
@@ -410,16 +368,14 @@ app.post("/pause", (req, res) => {
         res.status(400).json({ error: "Bot not spawned" });
         return;
     }
-    bot.chat("/pause");
-    bot.waitForTicks(bot.waitTicks).then(() => {
+    if (FAKE_WORLD) {
         res.json({ message: "Success" });
-    });
+        return;
+    }
+    bot.chat("/pause");
+    bot.waitForTicks(bot.waitTicks).then(() => res.json({ message: "Success" }));
 });
 
-// Server listening to PORT 3000
-
-const DEFAULT_PORT = 3000;
-const PORT = process.argv[2] || DEFAULT_PORT;
 app.listen(PORT, () => {
-    console.log(`Server started on port ${PORT}`);
+    console.log(`Server started on port ${PORT}${FAKE_WORLD ? " (fake world)" : ""}`);
 });

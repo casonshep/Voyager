@@ -64,4 +64,4 @@ function getInventoryItems(bot) {
     return items;
 }
 
-module.exports = { Voxels, BlockRecords };
+module.exports = { Voxels, BlockRecords, getSurroundingBlocks, getInventoryItems };

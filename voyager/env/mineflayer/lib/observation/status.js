@@ -30,8 +30,10 @@ class Status extends Observation {
                 : "None",
             entities: this.getEntities(),
             timeOfDay: this.getTime(),
-            inventoryUsed: this.bot.inventoryUsed(),
-            elapsedTime: this.bot.globalTickCounter,
+            inventoryUsed: this.bot.inventory
+                ? this.bot.inventory.slots.slice(9, 45).filter((item) => item !== null).length
+                : 0,
+            elapsedTime: this.bot.globalTickCounter || 0,
         };
     }
 

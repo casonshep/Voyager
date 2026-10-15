@@ -72,78 +72,56 @@ You need to install fabric mods to support all the features in Voyager. Remember
 Follow the instructions in [Fabric Mods Install](installation/fabric_mods_install.md) to install the mods.
 
 # Getting Started
-Voyager uses OpenAI's GPT-4 as the language model. You need to have an OpenAI API key to use Voyager. You can get one from [here](https://platform.openai.com/account/api-keys).
 
-After the installation process, you can run Voyager by:
-```python
-from voyager import Voyager
+This fork replaces the GPT-writes-programs loop with three systems (design
+record: [PLAN.md](PLAN.md)):
 
-# You can also use mc_port instead of azure_login, but azure_login is highly recommended
-azure_login = {
-    "client_id": "YOUR_CLIENT_ID",
-    "redirect_url": "https://127.0.0.1/auth-response",
-    "secret_value": "[OPTIONAL] YOUR_SECRET_VALUE",
-    "version": "fabric-loader-0.14.18-1.19", # the version Voyager is tested on
-}
-openai_api_key = "YOUR_API_KEY"
+| System | Where | What it does |
+| --- | --- | --- |
+| Decomposer | `voyager/tree/decomposer.py` | Turns a GPT goal ("obtain a stone pickaxe") into a tree of subtasks. Every node has a code-checkable `VerifySpec` (`has_item`, `near_block`, `has_tool_tier`, ...). Recipes, tool tiers, furnaces and fuel come from `GET /knowledge` (minecraft-data plus `lib/mcKnowledge.js`). One node per item, sized for whole-tree demand; a node's `done` flag is persisted the moment it verifies. |
+| Jev action loop | `voyager/env/mineflayer/lib/agentLoop.js` | Runs one subtask at a time. Each decision: observe (`lib/observe.js`), build a menu, digest the snapshot into words (`lib/jevState.js`), ask Jev one request (action Choice over the shuffled menu plus `none_of_these`, a `completable` Noul over the whole menu, a danger Noul, a progress Score, and per-option "would this change anything" Nouls), execute one bounded action, label the outcome (`lib/outcomes.js`), log the record to `decisions.jsonl`, check the spec. The starting menu is movement and looking only (`lib/baseActions.js`). |
+| Action builder | `voyager/tree/builder.py` | When the `completable` Noul stays below 0.5 over a 10-action window, or on stuck routing, the builder first **repairs** a failing action built for the subtask in place (same name, full source, every labelled outcome, earlier versions; up to 3 repairs, then the best version that ever worked is restored). Otherwise Jev picks the kind and target of the missing action and GPT writes one mineflayer primitive (`menu` / `execute` / optional `observe`). Drafts are checked, registered as trials, and persisted with versions under the library. Prompts carry the closest completed trace and the family lesson. Builds run on a background thread. |
+| Post-goal review | `voyager/tree/review.py` | After each goal, a fresh-context GPT call per lesson family reads that goal's decision records and rewrites `lessons/<family>.md` (Tried / Observed / Still doubt / Test next, each bullet citing record ids) and the remedy store. The builder reads the lessons; the curriculum reads the "Test next" items. |
+| Traversal | `voyager/tree/traversal.py` | Post-order over the tree. Routes stuck and budget triggers: build, retry with half the budget, re-decompose the node, or fail the chain and ask GPT for a new goal. |
 
-voyager = Voyager(
-    azure_login=azure_login,
-    openai_api_key=openai_api_key,
-)
+Jev never sees code: the one-line description a primitive's `menu()` writes
+is its whole interface.
 
-# start lifelong learning
-voyager.learn()
+## Run
+
+Keys go in `.env` (`OPENAI_API_KEY`, `TYPESAFE_API_KEY`; the loop falls back to
+plain code without Jev). Open a Minecraft world to LAN and note the port.
+
+```bash
+venv/Scripts/python run_tree.py --mc-port 54321                              # GPT proposes goals; a fresh run starts with "Obtain 1 wood log"
+venv/Scripts/python run_tree.py --mc-port 54321 --goal "obtain a wooden pickaxe" --max-goals 1
+venv/Scripts/python run_tree.py --resume ckpt_20261002_120000                 # reload the tree in progress and saved primitives
+venv/Scripts/python run_tree.py --help
 ```
 
-* If you are running with `Azure Login` for the first time, it will ask you to follow the command line instruction to generate a config file.
-* For `Azure Login`, you also need to select the world and open the world to LAN by yourself. After you run `voyager.learn()` the game will pop up soon, you need to:
-  1. Select `Singleplayer` and press `Create New World`.
-  2. Set Game Mode to `Creative` and Difficulty to `Peaceful`.
-  3. After the world is created, press `Esc` key and press `Open to LAN`.
-  4. Select `Allow cheats: ON` and press `Start LAN World`. You will see the bot join the world soon. 
+Checkpoints: `<ckpt>/tree/<goal_id>.json` (the tree with done flags and
+traces), `<ckpt>/decisions.jsonl` (one record per action: what the bot saw,
+Jev's answer, the action, its labelled outcome, timings),
+`<ckpt>/typesafe/*.jsonl` (Jev requests, builds, repairs, reviews),
+`<ckpt>/curriculum/` (goals completed and failed). The shared library
+(`--library`, default `skill_library/tree`) holds `<name>.js` + `.json`
+(learned actions), `versions/` (earlier versions of repaired actions),
+`traces/` (records of completed subtasks), `lessons/` (review output), and
+`_archive/` (pruned duplicates).
 
-# Resume from a checkpoint during learning
+## Offline checks (no Minecraft, no keys)
 
-If you stop the learning process and want to resume from a checkpoint later, you can instantiate Voyager by:
-```python
-from voyager import Voyager
-
-voyager = Voyager(
-    azure_login=azure_login,
-    openai_api_key=openai_api_key,
-    ckpt_dir="YOUR_CKPT_DIR",
-    resume=True,
-)
+```bash
+venv/Scripts/python tests/run_tests.py                       # tree, traversal and builder tests against a fake bridge
+cd voyager/env/mineflayer
+node scripts/verify_test.js                                  # every VerifySpec predicate against a canned plains world
+node scripts/agentloop_dryrun.js                             # snapshot + menu; one real Jev decision when TYPESAFE_API_KEY is exported
+FAKE_WORLD=1 node index.js 3999                              # serve /knowledge and /agent/* over the canned bot (it cannot move or mine)
 ```
 
-# Run Voyager for a specific task with a learned skill library
-
-If you want to run Voyager for a specific task with a learned skill library, you should first pass the skill library directory to Voyager:
-```python
-from voyager import Voyager
-
-# First instantiate Voyager with skill_library_dir.
-voyager = Voyager(
-    azure_login=azure_login,
-    openai_api_key=openai_api_key,
-    skill_library_dir="./skill_library/trial1", # Load a learned skill library.
-    ckpt_dir="YOUR_CKPT_DIR", # Feel free to use a new dir. Do not use the same dir as skill library because new events will still be recorded to ckpt_dir. 
-    resume=False, # Do not resume from a skill library because this is not learning.
-)
-```
-Then, you can run task decomposition. Notice: Occasionally, the task decomposition may not be logical. If you notice the printed sub-goals are flawed, you can rerun the decomposition.
-```python
-# Run task decomposition
-task = "YOUR TASK" # e.g. "Craft a diamond pickaxe"
-sub_goals = voyager.decompose_task(task=task)
-```
-Finally, you can run the sub-goals with the learned skill library:
-```python
-voyager.inference(sub_goals=sub_goals)
-```
-
-For all valid skill libraries, see [Learned Skill Libraries](skill_library/README.md).
+The Node HTTP surface (`/knowledge`, `/agent/subtask`, `/agent/status`,
+`/agent/verify`, `/agent/primitive`, `/agent/stop`) and the snapshot and
+tree schemas are specified in PLAN.md sections 1, 3 and 7.
 
 # FAQ
 If you have any questions, please check our [FAQ](FAQ.md) first before opening an issue.
